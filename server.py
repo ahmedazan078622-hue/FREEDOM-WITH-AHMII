@@ -19,8 +19,6 @@ BINANCE_ENDPOINTS = [
 ]
 OWNER_LABEL = "03254112787"
 PKT_TZ = timezone(timedelta(hours=5))
-
-SCANNER_KEYS = ["V1", "ICT", "HB", "PA"]
 SYMBOL_REFRESH_SECONDS = 900
 
 EXCLUDED_BASES = {
@@ -101,22 +99,13 @@ def smoothed_heikin_ashi(df: pd.DataFrame, smooth_len: int = 6) -> pd.DataFrame:
     s_close = df["close"].ewm(span=smooth_len, adjust=False).mean()
 
     ha_close = (s_open + s_high + s_low + s_close) / 4.0
-    ha_open = np.zeros(len(df), dtype=float)
+    ha_open = np.empty(len(df), dtype=float)
     ha_open[0] = (float(s_open.iloc[0]) + float(s_close.iloc[0])) / 2.0
+    hc_arr = ha_close.to_numpy(dtype=float)
     for i in range(1, len(df)):
-        ha_open[i] = (ha_open[i - 1] + float(ha_close.iloc[i - 1])) / 2.0
+        ha_open[i] = (ha_open[i - 1] + hc_arr[i - 1]) / 2.0
 
-    ha_open_s = pd.Series(ha_open, index=df.index)
-    ha_high_s = pd.concat([s_high, ha_open_s, ha_close], axis=1).max(axis=1)
-    ha_low_s = pd.concat([s_low, ha_open_s, ha_close], axis=1).min(axis=1)
-
-    out = pd.DataFrame(index=df.index)
-    out["ha_open"] = ha_open_s
-    out["ha_high"] = ha_high_s
-    out["ha_low"] = ha_low_s
-    out["ha_close"] = ha_close
-    out["is_green"] = out["ha_close"] > out["ha_open"]
-    return out
+    return pd.DataFrame({"is_green": hc_arr > ha_open}, index=df.index)
 
 
 def fetch_json_with_fallback(
@@ -124,7 +113,7 @@ def fetch_json_with_fallback(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     preferred_url: Optional[str] = None,
-    timeout: int = 8,
+    timeout: int = 6,
 ):
     urls = list(BINANCE_ENDPOINTS)
     if preferred_url and preferred_url in urls:
@@ -151,7 +140,7 @@ def fetch_json_with_fallback(
 
 
 def get_spot_usdt_symbols(session: requests.Session):
-    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=10)
+    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=8)
     valid_spot: Set[str] = set()
     for s in info_data.get("symbols", []):
         base = s.get("baseAsset", "")
@@ -168,7 +157,7 @@ def get_spot_usdt_symbols(session: requests.Session):
             valid_spot.add(sym)
     try:
         tickers, working_url = fetch_json_with_fallback(
-            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=10
+            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=8
         )
         vol_map: Dict[str, float] = {}
         for t in tickers:
@@ -191,7 +180,7 @@ def fetch_klines_df(
         "/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         preferred_url=base_url,
-        timeout=8,
+        timeout=6,
     )
     if not raw:
         return pd.DataFrame()
@@ -239,27 +228,16 @@ def _detect_trend_1h(df_1h: pd.DataFrame, lookback: int = 36) -> Optional[str]:
 
 
 def check_v1_rule(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFrame):
-    """
-    V1:
-    - 1D & 1H trend UP
-    - 1H RSI 53..57
-    - 1H Smoothed Heikin Ashi green
-    - Pre-check 30m Smoothed Heikin Ashi green & 30m RSI > 1H RSI
-    """
     if not _trend_up(df_1h) or not _trend_up(df_1d):
         return None
     if df_30m.empty or len(df_30m) < 25:
         return None
 
-    rsi_1h_s = calculate_rsi(df_1h["close"], 14)
-    rsi_30m_s = calculate_rsi(df_30m["close"], 14)
-    rsi_1h = float(rsi_1h_s.iloc[-1])
-    rsi_30m = float(rsi_30m_s.iloc[-1])
+    rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    rsi_30m = float(calculate_rsi(df_30m["close"], 14).iloc[-1])
     if np.isnan(rsi_1h) or np.isnan(rsi_30m):
         return None
-    if not (53.0 <= rsi_1h <= 57.0):
-        return None
-    if not (rsi_30m > rsi_1h):
+    if not (53.0 <= rsi_1h <= 57.0) or not (rsi_30m > rsi_1h):
         return None
 
     ha_1h = smoothed_heikin_ashi(df_1h, smooth_len=6)
@@ -280,13 +258,6 @@ def check_v1_rule(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFrame
 
 
 def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
-    """
-    PA:
-    - UP trend with 1H RSI 30..40 OR SIDEWAYS trend with 1H RSI 25..40
-    - Find strong support & resistance on 1H
-    - Signal when price reaches support zone
-    - After a signal on a symbol, block re-signal until price pumps >= 1% from last signaled price
-    """
     if df_1h.empty or len(df_1h) < 40 or trend_1h not in ("UP", "SIDEWAYS"):
         return None
     rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
@@ -305,15 +276,14 @@ def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
     if curr_price <= 0:
         return None
 
-    # Identify swing lows as support and swing highs as resistance
-    support_levels: List[float] = []
-    resistance_levels: List[float] = []
-    for i in range(1, len(window) - 1):
-        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
-            support_levels.append(float(lows[i]))
-        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
-            resistance_levels.append(float(highs[i]))
-
+    support_levels = [
+        float(lows[i]) for i in range(1, len(window) - 1)
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]
+    ]
+    resistance_levels = [
+        float(highs[i]) for i in range(1, len(window) - 1)
+        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]
+    ]
     if not support_levels or not resistance_levels:
         return None
 
@@ -322,7 +292,6 @@ def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
     if strong_resistance <= strong_support:
         return None
 
-    # Price touching / inside support zone (within 0.6% buffer)
     near_support = (curr_low <= strong_support * 1.006) and (curr_price >= strong_support * 0.992)
     if not near_support:
         return None
@@ -349,7 +318,6 @@ def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
 def _no_body_touch_between(
     opens: np.ndarray, closes: np.ndarray, idx_a: int, idx_b: int, y_a: float, y_b: float
 ) -> bool:
-    """Ensure no intermediate candle body [min(open, close), max(open, close)] crosses the line between idx_a and idx_b."""
     start_i = min(idx_a, idx_b)
     end_i = max(idx_a, idx_b)
     if end_i - start_i <= 1:
@@ -357,21 +325,12 @@ def _no_body_touch_between(
     for k in range(start_i + 1, end_i):
         t = (k - idx_a) / float(idx_b - idx_a)
         line_y = y_a + t * (y_b - y_a)
-        b_low = min(opens[k], closes[k])
-        b_high = max(opens[k], closes[k])
-        if b_low <= line_y <= b_high:
+        if min(opens[k], closes[k]) <= line_y <= max(opens[k], closes[k]):
             return False
     return True
 
 
 def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
-    """
-    HB (Hidden Bullish):
-    - 1H: current swing low < previous swing low, current RSI at low > previous RSI at low
-    - No candle body touch between the two swing lows (wicks allowed)
-    - At least 4 candles spacing between the two lows
-    - 1H RSI 25..40 and 30m RSI > 1H RSI
-    """
     if df_1h.empty or df_30m.empty or len(df_1h) < 40 or len(df_30m) < 25:
         return None
 
@@ -381,9 +340,7 @@ def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     rsi_30m = float(rsi_30m_s.iloc[-1])
     if np.isnan(rsi_1h) or np.isnan(rsi_30m):
         return None
-    if not (25.0 <= rsi_1h <= 40.0):
-        return None
-    if not (rsi_30m > rsi_1h):
+    if not (25.0 <= rsi_1h <= 40.0) or not (rsi_30m > rsi_1h):
         return None
 
     opens = df_1h["open"].to_numpy(dtype=float)
@@ -391,8 +348,7 @@ def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     lows = df_1h["low"].to_numpy(dtype=float)
     rsi_arr = rsi_1h_s.to_numpy(dtype=float)
 
-    n = len(df_1h)
-    curr_idx = n - 1
+    curr_idx = len(df_1h) - 1
     curr_low = lows[curr_idx]
     curr_rsi = rsi_arr[curr_idx]
     if np.isnan(curr_rsi):
@@ -402,31 +358,20 @@ def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
         if lows[prev_idx] <= lows[prev_idx - 1] and lows[prev_idx] <= lows[prev_idx + 1]:
             prev_low = lows[prev_idx]
             prev_rsi = rsi_arr[prev_idx]
-            if np.isnan(prev_rsi):
-                continue
-            # Price makes lower low while RSI makes higher low
-            if curr_low < prev_low and curr_rsi > prev_rsi:
+            if not np.isnan(prev_rsi) and curr_low < prev_low and curr_rsi > prev_rsi:
                 if _no_body_touch_between(opens, closes, prev_idx, curr_idx, prev_low, curr_low):
-                    candles_apart = curr_idx - prev_idx
                     price = float(df_1h["close"].iloc[-1])
                     return {
                         "scanner": "HB",
                         "timeframe": "60",
                         "price": f"{price:.8f}".rstrip("0").rstrip("."),
                         "metric": f"1H RSI {rsi_1h:.1f} · 30m {rsi_30m:.1f}",
-                        "detail": f"4+ Candles ({candles_apart}c) · Low<PrevLow · RSI>PrevRSI · 30m>1H",
+                        "detail": f"4+ Candles ({curr_idx - prev_idx}c) · Low<PrevLow · RSI>PrevRSI · 30m>1H",
                     }
     return None
 
 
 def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
-    """
-    ICT:
-    - 1H market SIDEWAYS, 1H RSI 30..40
-    - Prior to current red candle, consecutive green candles (2..5 green candles treated as one leg/candle) >= 1% pump
-    - Trendline connecting prior red candle to current red candle has no candle body touch in between
-    - Triggers as soon as next green candle begins
-    """
     if df_1h.empty or len(df_1h) < 30 or trend_1h != "SIDEWAYS":
         return None
     rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
@@ -437,16 +382,12 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
     closes = df_1h["close"].to_numpy(dtype=float)
     n = len(df_1h)
 
-    # Current candle must just be starting as green, preceded by a red candle
     if not (closes[-1] > opens[-1]):
         return None
     curr_red_idx = n - 2
-    if curr_red_idx < 5:
-        return None
-    if not (closes[curr_red_idx] < opens[curr_red_idx]):
+    if curr_red_idx < 5 or not (closes[curr_red_idx] < opens[curr_red_idx]):
         return None
 
-    # Walk backwards from curr_red_idx - 1 to find consecutive green candles (treated as 2-5 green block)
     g_end = curr_red_idx - 1
     while g_end >= 1 and closes[g_end] <= opens[g_end]:
         g_end -= 1
@@ -459,28 +400,20 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
         green_count += 1
         g_start -= 1
     g_start += 1
-
-    if green_count < 2:
+    if green_count < 2 or opens[g_start] <= 0:
         return None
 
-    leg_start_open = opens[g_start]
-    leg_end_close = closes[g_end]
-    if leg_start_open <= 0:
-        return None
-    pump_pct = ((leg_end_close - leg_start_open) / leg_start_open) * 100.0
+    pump_pct = ((closes[g_end] - opens[g_start]) / opens[g_start]) * 100.0
     if pump_pct < 1.0:
         return None
 
-    # Find prior red candle before the green cluster
     prev_red_idx = g_start - 1
     while prev_red_idx >= 0 and closes[prev_red_idx] >= opens[prev_red_idx]:
         prev_red_idx -= 1
     if prev_red_idx < 0:
         return None
 
-    y_prev_red = closes[prev_red_idx]
-    y_curr_red = closes[curr_red_idx]
-    if not _no_body_touch_between(opens, closes, prev_red_idx, curr_red_idx, y_prev_red, y_curr_red):
+    if not _no_body_touch_between(opens, closes, prev_red_idx, curr_red_idx, closes[prev_red_idx], closes[curr_red_idx]):
         return None
 
     price = float(df_1h["close"].iloc[-1])
@@ -513,35 +446,25 @@ def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -
             return []
 
         trend_1h = _detect_trend_1h(df_1h) if (en_pa or en_ict) else None
-
-        df_30m = (
-            fetch_klines_df(shared_session, symbol, base_url, "30m", 100)
-            if (en_v1 or en_hb) else pd.DataFrame()
-        )
-        df_1d = (
-            fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
-            if en_v1 else pd.DataFrame()
-        )
+        df_30m = fetch_klines_df(shared_session, symbol, base_url, "30m", 100) if (en_v1 or en_hb) else pd.DataFrame()
+        df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250) if en_v1 else pd.DataFrame()
 
         if en_v1:
-            sig_v1 = check_v1_rule(df_1h, df_1d, df_30m)
-            if sig_v1:
-                found.append(sig_v1)
-
+            sig = check_v1_rule(df_1h, df_1d, df_30m)
+            if sig:
+                found.append(sig)
         if en_hb:
-            sig_hb = check_hb_rule(df_1h, df_30m)
-            if sig_hb:
-                found.append(sig_hb)
-
+            sig = check_hb_rule(df_1h, df_30m)
+            if sig:
+                found.append(sig)
         if en_pa:
-            sig_pa = check_pa_rule(symbol, df_1h, trend_1h)
-            if sig_pa:
-                found.append(sig_pa)
-
+            sig = check_pa_rule(symbol, df_1h, trend_1h)
+            if sig:
+                found.append(sig)
         if en_ict:
-            sig_ict = check_ict_rule(df_1h, trend_1h)
-            if sig_ict:
-                found.append(sig_ict)
+            sig = check_ict_rule(df_1h, trend_1h)
+            if sig:
+                found.append(sig)
 
         now_dt = datetime.now(timezone.utc)
         now_str = format_pkt_time(now_dt)
@@ -584,7 +507,7 @@ def _bg_loop() -> None:
                 SCAN_STATUS["total"] = len(cached_symbols)
                 SCAN_STATUS["working_url"] = working_url
 
-            with ThreadPoolExecutor(max_workers=14) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = [pool.submit(_scan_symbol, sym, working_url, session) for sym in cached_symbols]
                 for fut in as_completed(futures):
                     if _stop_event.is_set():
@@ -593,10 +516,8 @@ def _bg_loop() -> None:
                         if not any(SCANNER_ENABLED.values()):
                             break
                     res_list = fut.result()
-                    now_ts = time.time()
                     with _lock:
                         for item in res_list:
-                            # Deduplicate exact scanner+symbol+metric while keeping history until Clear
                             dup = any(
                                 s.get("scanner") == item["scanner"]
                                 and s.get("symbol") == item["symbol"]
@@ -678,10 +599,7 @@ HTML_PAGE = """<!DOCTYPE html>
       min-height: 100vh;
       padding: 16px 16px 44px;
     }
-    .wrap {
-      max-width: 1560px;
-      margin: 0 auto;
-    }
+    .wrap { max-width: 1560px; margin: 0 auto; }
     .top-brand {
       text-align: center;
       padding: 12px 16px 14px;
@@ -717,7 +635,6 @@ HTML_PAGE = """<!DOCTYPE html>
       cursor: pointer;
     }
     .clear-btn:hover { background: #3b0d1c; }
-
     .main-layout {
       display: flex;
       flex-direction: row;
@@ -801,7 +718,6 @@ HTML_PAGE = """<!DOCTYPE html>
       letter-spacing: 0.8px;
       color: #34d399;
     }
-
     .mini-tabs {
       display: flex;
       gap: 8px;
