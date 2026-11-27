@@ -1,7 +1,7 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 
 import numpy as np
@@ -18,6 +18,7 @@ BINANCE_ENDPOINTS = [
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 
 OWNER_LABEL = "03254112787"
+PKT_TZ = timezone(timedelta(hours=5))
 SIGNAL_TTL_SECONDS = 20 * 60
 ALERT_COOLDOWN_SECONDS = 900
 SYMBOL_REFRESH_SECONDS = 900
@@ -48,6 +49,10 @@ SCAN_STATUS: Dict[str, Any] = {
 }
 _lock = threading.Lock()
 _stop_event = threading.Event()
+
+
+def format_pkt_time(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(PKT_TZ).strftime("%H:%M:%S PKT")
 
 
 def prune_expired_signals_locked(now_ts: float):
@@ -633,7 +638,7 @@ def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -
                 found.append(sig_pa)
 
         now_dt = datetime.now(timezone.utc)
-        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_str = format_pkt_time(now_dt)
         now_ts = now_dt.timestamp()
         for item in found:
             item["symbol"] = symbol
@@ -684,7 +689,7 @@ def _bg_loop():
 
             with _lock:
                 prune_expired_signals_locked(time.time())
-                SCAN_STATUS["last_cycle"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                SCAN_STATUS["last_cycle"] = format_pkt_time(datetime.now(timezone.utc))
         except Exception:
             pass
 
@@ -928,7 +933,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>1% Target</th><th>Setup</th><th>Entry</th></tr></thead>
+            <thead><tr><th>Time (PKT)</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>1% Target</th><th>Setup</th><th>Entry</th></tr></thead>
             <tbody id="body-V1"></tbody>
           </table>
           <div class="empty-box" id="empty-V1">Scanning Binance Spot USDT for V1 METHOD...</div>
@@ -945,7 +950,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>Prev RSI</th><th>Bars</th><th>Close</th></tr></thead>
+            <thead><tr><th>Time (PKT)</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>Prev RSI</th><th>Bars</th><th>Close</th></tr></thead>
             <tbody id="body-HB"></tbody>
           </table>
           <div class="empty-box" id="empty-HB">Scanning Binance Spot USDT for HIDEEN BULLISH...</div>
@@ -962,7 +967,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Time</th><th>Pair</th><th>Trend (RSI)</th><th>1H Support</th><th>1H Resist</th><th>Gap %</th><th>Price</th></tr></thead>
+            <thead><tr><th>Time (PKT)</th><th>Pair</th><th>Trend (RSI)</th><th>1H Support</th><th>1H Resist</th><th>Gap %</th><th>Price</th></tr></thead>
             <tbody id="body-PA"></tbody>
           </table>
           <div class="empty-box" id="empty-PA">Scanning Binance Spot USDT for PRICE ACTION...</div>
@@ -979,7 +984,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>Candles</th><th>Pump %</th><th>Touch</th><th>Price</th></tr></thead>
+            <thead><tr><th>Time (PKT)</th><th>Pair</th><th>1H RSI</th><th>Candles</th><th>Pump %</th><th>Touch</th><th>Price</th></tr></thead>
             <tbody id="body-ICT"></tbody>
           </table>
           <div class="empty-box" id="empty-ICT">Scanning Binance Spot USDT for ICT...</div>
@@ -994,6 +999,21 @@ HTML_PAGE = """<!DOCTYPE html>
     let freshKeys = new Set();
     let firstLoad = true;
     let audioCtx = null;
+
+    function toPktString(tsSec, fallbackStr) {
+      if (typeof tsSec === "number" && !Number.isNaN(tsSec)) {
+        const d = new Date(tsSec * 1000);
+        const hh = d.toLocaleTimeString("en-GB", {
+          timeZone: "Asia/Karachi",
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+        return `${hh} PKT`;
+      }
+      return fallbackStr || "";
+    }
 
     function unlockAudio() {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1071,9 +1091,9 @@ HTML_PAGE = """<!DOCTYPE html>
           `https://www.tradingview.com/chart/?symbol=BINANCE:${s.symbol}&interval=${s.timeframe || 60}`,
           "_blank"
         );
-        const shortTime = (s.detected_at || "").split(" ")[1] || s.detected_at;
+        const pktTime = toPktString(s.created_ts, s.detected_at);
         tr.innerHTML = `
-          <td>${shortTime}</td>
+          <td>${pktTime}</td>
           <td class="pair">${s.symbol}</td>
           <td>${s.col1}</td>
           <td>${s.col2}</td>
