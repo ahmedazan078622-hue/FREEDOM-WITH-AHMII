@@ -286,30 +286,41 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
 
 
 def check_oc_gap_4h_rule(df_4h: pd.DataFrame):
-    """OC GAP: 4H timeframe par open-close / imbalance gap."""
-    if df_4h.empty or len(df_4h) < 5:
+    """OC GAP: 4H timeframe par recent bullish open-close / imbalance gap."""
+    if df_4h.empty or len(df_4h) < 8:
         return None
     opens = df_4h["open"].to_numpy(dtype=float)
     closes = df_4h["close"].to_numpy(dtype=float)
     lows = df_4h["low"].to_numpy(dtype=float)
     highs = df_4h["high"].to_numpy(dtype=float)
-    i = len(df_4h) - 1
-    prev_close = closes[i - 1]
-    curr_open = opens[i]
-    curr_close = closes[i]
-    if prev_close <= 0 or curr_open <= prev_close or curr_close <= curr_open:
+    n = len(df_4h)
+    curr_price = closes[-1]
+    if curr_price <= 0:
         return None
-    gap_pct = ((curr_open - prev_close) / prev_close) * 100.0
-    if gap_pct < 0.35:
-        return None
-    if i >= 2 and highs[i - 2] < lows[i]:
-        return {
-            "scanner": "OC",
-            "timeframe": "240",
-            "metric": f"4H Gap +{gap_pct:.2f}%",
-            "detail": f"Low {lows[i]:.6f}".rstrip("0").rstrip("."),
-            "price": f"{curr_close:.8f}".rstrip("0").rstrip("."),
-        }
+
+    # Check last 5 4H candles for an active bullish OC gap / FVG
+    for idx in range(n - 1, max(2, n - 6), -1):
+        prev_close = closes[idx - 1]
+        c_open = opens[idx]
+        c_close = closes[idx]
+        if prev_close <= 0 or c_close <= c_open:
+            continue
+
+        oc_gap_pct = ((c_open - prev_close) / prev_close) * 100.0
+        fvg_gap_pct = ((lows[idx] - highs[idx - 2]) / max(highs[idx - 2], 1e-12)) * 100.0 if highs[idx - 2] < lows[idx] else 0.0
+
+        if oc_gap_pct >= 0.15 or fvg_gap_pct >= 0.15:
+            gap_val = max(oc_gap_pct, fvg_gap_pct)
+            zone_low = min(prev_close, c_open, lows[idx])
+            zone_high = max(prev_close, c_open, highs[idx])
+            if zone_low * 0.985 <= curr_price <= zone_high * 1.03:
+                return {
+                    "scanner": "OC",
+                    "timeframe": "240",
+                    "metric": f"4H Gap +{gap_val:.2f}%",
+                    "detail": f"Zone {zone_low:.6f}".rstrip("0").rstrip("."),
+                    "price": f"{curr_price:.8f}".rstrip("0").rstrip("."),
+                }
     return None
 
 
