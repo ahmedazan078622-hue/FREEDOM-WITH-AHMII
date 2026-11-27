@@ -526,30 +526,22 @@ HTML_PAGE = """<!DOCTYPE html>
     * { box-sizing: border-box; font-family: 'Segoe UI', Arial, sans-serif; }
     body {
       margin: 0;
-      background: #000000;
+      background: #05080e;
       color: #f8fafc;
       min-height: 100vh;
       padding: 18px 16px 44px;
     }
     .wrap {
-      max-width: 1480px;
+      max-width: 1520px;
       margin: 0 auto;
     }
-    .top-brand {
+    .top-bar {
       text-align: center;
-      padding: 14px 16px 18px;
-      margin-bottom: 18px;
-      border-bottom: 1px solid #1e293b;
-    }
-    .top-brand h1 {
-      margin: 0;
-      font-size: 28px;
-      letter-spacing: 2px;
-      font-weight: 800;
-      color: #ffffff;
+      padding: 12px 16px 16px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid #1b2434;
     }
     .status-line {
-      margin-top: 8px;
       font-size: 12px;
       color: #94a3b8;
       display: flex;
@@ -558,10 +550,86 @@ HTML_PAGE = """<!DOCTYPE html>
       flex-wrap: wrap;
     }
     .status-line b { color: #38bdf8; }
+    .main-layout {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
     .stack-list {
+      flex: 1;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       gap: 16px;
+    }
+    .side-panel {
+      width: 280px;
+      flex-shrink: 0;
+      position: sticky;
+      top: 16px;
+    }
+    .brand-card {
+      background: linear-gradient(180deg, #0b1915 0%, #090e18 100%);
+      border: 1px solid #1c352c;
+      border-radius: 14px;
+      padding: 20px 16px;
+      text-align: center;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    }
+    .bismillah-top {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 1.6px;
+      color: #6ee7b7;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(110, 231, 183, 0.16);
+    }
+    .brand-bars {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 18px;
+      margin-bottom: 8px;
+    }
+    .brand-bars span {
+      width: 4px;
+      border-radius: 2px;
+      background: #34d399;
+    }
+    .brand-bars span:nth-child(1) { height: 7px; opacity: 0.65; }
+    .brand-bars span:nth-child(2) { height: 12px; opacity: 0.85; }
+    .brand-bars span:nth-child(3) { height: 18px; }
+    .brand-name {
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: 0.8px;
+      color: #ffffff;
+      line-height: 1.25;
+    }
+    .brand-sub {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 6px;
+    }
+    .contact-box {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #1c2738;
+    }
+    .contact-lbl {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.4px;
+      color: #64748b;
+      text-transform: uppercase;
+    }
+    .contact-num {
+      margin-top: 5px;
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 0.8px;
+      color: #34d399;
     }
     .section-row {
       background: #090d16;
@@ -641,12 +709,15 @@ HTML_PAGE = """<!DOCTYPE html>
       color: #475569;
       font-size: 12px;
     }
+    @media (max-width: 900px) {
+      .main-layout { flex-direction: column; }
+      .side-panel { width: 100%; position: static; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="top-brand">
-      <h1>FREEDOM WITH AHMII</h1>
+    <div class="top-bar">
       <div class="status-line">
         <span>Market: <b>SPOT USDT</b></span>
         <span>Scanned: <b id="stScan">0/0</b></span>
@@ -656,46 +727,63 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="stack-list">
-      <div class="section-row">
-        <div class="section-head">
-          <span class="section-title t-V1">V1 METHOD</span>
-          <span class="section-cnt" id="cnt-V1">0</span>
+    <div class="main-layout">
+      <div class="stack-list">
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-V1">V1 METHOD</span>
+            <span class="section-cnt" id="cnt-V1">0</span>
+          </div>
+          <div class="coin-strip" id="list-V1"></div>
         </div>
-        <div class="coin-strip" id="list-V1"></div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-HB">HIDDEN BULLISH</span>
+            <span class="section-cnt" id="cnt-HB">0</span>
+          </div>
+          <div class="coin-strip" id="list-HB"></div>
+        </div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-PA">PRICE ACTION</span>
+            <span class="section-cnt" id="cnt-PA">0</span>
+          </div>
+          <div class="coin-strip" id="list-PA"></div>
+        </div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-ICT">ICT</span>
+            <span class="section-cnt" id="cnt-ICT">0</span>
+          </div>
+          <div class="coin-strip" id="list-ICT"></div>
+        </div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-GN">GAINERS</span>
+            <span class="section-cnt" id="cnt-GN">0</span>
+          </div>
+          <div class="coin-strip" id="list-GN"></div>
+        </div>
       </div>
 
-      <div class="section-row">
-        <div class="section-head">
-          <span class="section-title t-HB">HIDDEN BULLISH</span>
-          <span class="section-cnt" id="cnt-HB">0</span>
+      <aside class="side-panel">
+        <div class="brand-card">
+          <div class="bismillah-top">ALHUMDULLILHA</div>
+          <div class="brand-bars">
+            <span></span><span></span><span></span>
+          </div>
+          <div class="brand-name">FREEDOM WITH AHMII</div>
+          <div class="brand-sub">Binance Spot USDT Scanner</div>
+          <div class="contact-box">
+            <div class="contact-lbl">Contact Number</div>
+            <div class="contact-num">03254112787</div>
+          </div>
         </div>
-        <div class="coin-strip" id="list-HB"></div>
-      </div>
-
-      <div class="section-row">
-        <div class="section-head">
-          <span class="section-title t-PA">PRICE ACTION</span>
-          <span class="section-cnt" id="cnt-PA">0</span>
-        </div>
-        <div class="coin-strip" id="list-PA"></div>
-      </div>
-
-      <div class="section-row">
-        <div class="section-head">
-          <span class="section-title t-ICT">ICT</span>
-          <span class="section-cnt" id="cnt-ICT">0</span>
-        </div>
-        <div class="coin-strip" id="list-ICT"></div>
-      </div>
-
-      <div class="section-row">
-        <div class="section-head">
-          <span class="section-title t-GN">GAINERS</span>
-          <span class="section-cnt" id="cnt-GN">0</span>
-        </div>
-        <div class="coin-strip" id="list-GN"></div>
-      </div>
+      </aside>
     </div>
   </div>
 
