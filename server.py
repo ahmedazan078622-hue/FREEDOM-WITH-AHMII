@@ -15,11 +15,24 @@ HTML_PAGE = """<!DOCTYPE html>
       width: 100%;
       height: 100%;
       background: #000000;
+      color: #ffffff;
+      font-family: Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       overflow: hidden;
+    }
+    .brand {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-align: center;
     }
   </style>
 </head>
-<body></body>
+<body>
+  <div class="brand">FREEDOM WITH AHMII</div>
+</body>
 </html>
 """
 
