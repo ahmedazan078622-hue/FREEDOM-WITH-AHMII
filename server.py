@@ -735,88 +735,119 @@ HTML_PAGE = """<!DOCTYPE html>
   <title>FREEDOM WITH AHMII | 4 Live Scanners</title>
   <style>
     :root {
+      --font-main: 'Segoe UI', Arial, sans-serif;
       --bg: #080d1a;
       --card: #111827;
+      --card-elevated: #0d1424;
       --head: #162033;
-      --border: #2b384f;
+      --border: #334155;
+      --border-soft: #223047;
       --text: #f8fafc;
       --muted: #94a3b8;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; font-family: var(--font-main); }
     body {
       margin: 0;
-      font-family: 'Segoe UI', Arial, sans-serif;
-      background: radial-gradient(circle at top, #131e36 0%, var(--bg) 60%);
+      font-family: var(--font-main);
+      font-size: 14px;
+      line-height: 1.5;
+      background: radial-gradient(circle at top, #131e36 0%, var(--bg) 62%);
       color: var(--text);
       min-height: 100vh;
     }
-    .container { max-width: 1520px; margin: 0 auto; padding: 16px; }
-    .topbar {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      background: rgba(17, 24, 39, 0.95);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 14px 20px;
-      margin-bottom: 16px;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+    .container {
+      max-width: 1540px;
+      margin: 0 auto;
+      padding: 24px 20px 36px;
     }
+
+    /* Section Cards with Clear Border, Inner Padding & Outer Spacing */
+    .section-card {
+      background: var(--card);
+      border: 1.5px solid var(--border);
+      border-radius: 16px;
+      padding: 20px 22px;
+      margin-bottom: 22px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+    }
+
     .top-header-row {
       display: flex;
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 10px;
-      width: 100%;
-    }
-    .top-controls-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      width: 100%;
+      gap: 16px;
+      padding-bottom: 18px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--border-soft);
     }
     .brand h1 {
       margin: 0;
       font-size: 22px;
-      letter-spacing: 0.9px;
+      font-weight: 700;
+      letter-spacing: 0.8px;
+      line-height: 1.25;
       background: linear-gradient(90deg, #34d399, #60a5fa);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    .brand p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+    .brand p {
+      margin: 6px 0 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
     .owner-pill {
-      padding: 6px 14px;
+      padding: 8px 16px;
       border-radius: 999px;
       background: #1d4ed8;
+      border: 1px solid #60a5fa;
       color: #ffffff;
       font-size: 14px;
       font-weight: 700;
       letter-spacing: 0.6px;
       margin-left: auto;
     }
+
+    .top-controls-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
     .meta-strip {
       display: flex;
-      gap: 16px;
+      gap: 22px;
       flex-wrap: wrap;
       font-size: 13px;
       color: #cbd5e1;
-      background: #0b1222;
-      padding: 8px 14px;
-      border-radius: 10px;
-      border: 1px solid #1e293b;
+      background: var(--card-elevated);
+      padding: 12px 18px;
+      border-radius: 12px;
+      border: 1px solid var(--border-soft);
     }
-    .meta-strip b { color: #34d399; }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .meta-strip > span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .meta-strip b {
+      color: #34d399;
+      font-weight: 700;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
     button {
       border: 1px solid var(--border);
       background: #1e293b;
       color: var(--text);
-      padding: 8px 12px;
-      border-radius: 8px;
-      font-size: 12.5px;
+      padding: 9px 14px;
+      border-radius: 9px;
+      font-size: 13px;
       font-weight: 600;
       cursor: pointer;
       transition: 0.15s;
@@ -828,33 +859,53 @@ HTML_PAGE = """<!DOCTYPE html>
     .scanners-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
+      gap: 22px;
     }
     @media (max-width: 1080px) {
-      .scanners-grid { grid-template-columns: 1fr; }
+      .scanners-grid { grid-template-columns: 1fr; gap: 20px; }
     }
+
     .scanner-box {
       background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow: hidden;
+      border: 1.5px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
       display: flex;
       flex-direction: column;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.35);
-      min-height: 340px;
+      gap: 14px;
+      box-shadow: 0 12px 26px rgba(0, 0, 0, 0.35);
+      min-height: 350px;
     }
     .scanner-header {
-      padding: 12px 16px;
+      padding: 14px 16px;
       background: var(--head);
-      border-bottom: 1px solid var(--border);
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 10px;
+      gap: 14px;
     }
-    .scanner-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .scanner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .scanner-title {
+      font-size: 15px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .scanner-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 5px;
+      line-height: 1.45;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: inline-block;
+      flex-shrink: 0;
+    }
     .c-V1 { color: #34d399; } .d-V1 { background: #10b981; box-shadow: 0 0 8px #10b981; }
     .c-HB { color: #60a5fa; } .d-HB { background: #3b82f6; box-shadow: 0 0 8px #3b82f6; }
     .c-PA { color: #c084fc; } .d-PA { background: #a855f7; box-shadow: 0 0 8px #a855f7; }
@@ -863,34 +914,64 @@ HTML_PAGE = """<!DOCTYPE html>
     .count-pill {
       font-size: 12px;
       font-weight: 700;
-      padding: 4px 10px;
+      padding: 6px 12px;
       border-radius: 999px;
-      background: #0b1222;
+      background: var(--card-elevated);
       border: 1px solid var(--border);
       white-space: nowrap;
     }
-    .table-scroll { overflow-x: auto; max-height: 295px; overflow-y: auto; }
-    table { width: 100%; border-collapse: collapse; }
+    .table-scroll {
+      background: var(--card-elevated);
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      padding: 6px 8px;
+      overflow-x: auto;
+      max-height: 280px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0 4px;
+    }
     th, td {
-      padding: 9px 8px;
-      border-bottom: 1px solid #1f2937;
+      padding: 10px 10px;
       text-align: center;
-      font-size: 12.5px;
+      font-size: 13px;
       white-space: nowrap;
     }
     th {
-      background: #0b1222;
-      color: #94a3b8;
-      font-size: 11px;
+      background: #10192b;
+      color: #cbd5e1;
+      font-size: 11.5px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
       text-transform: uppercase;
       position: sticky;
       top: 0;
+      border-bottom: 1px solid var(--border);
     }
-    tbody tr:hover { background: rgba(59, 130, 246, 0.18); cursor: pointer; }
+    td {
+      border-bottom: 1px solid #1b273b;
+      color: #e2e8f0;
+    }
+    tbody tr:hover td {
+      background: rgba(59, 130, 246, 0.18);
+      cursor: pointer;
+    }
     tr.flash td { background: rgba(16, 185, 129, 0.25); }
-    .pair { font-weight: 700; color: #f8fafc; }
+    .pair {
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: 0.3px;
+    }
+    .key-metric {
+      font-weight: 700;
+      color: #34d399;
+    }
     .empty-box {
-      padding: 50px 15px;
+      padding: 52px 18px;
       text-align: center;
       color: var(--muted);
       font-size: 13px;
@@ -899,7 +980,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
-    <div class="topbar">
+    <div class="section-card topbar">
       <div class="top-header-row">
         <div class="brand">
           <h1>FREEDOM WITH AHMII</h1>
@@ -1095,11 +1176,11 @@ HTML_PAGE = """<!DOCTYPE html>
         tr.innerHTML = `
           <td>${pktTime}</td>
           <td class="pair">${s.symbol}</td>
-          <td>${s.col1}</td>
+          <td class="key-metric">${s.col1}</td>
           <td>${s.col2}</td>
           <td>${s.col3}</td>
           <td>${s.col4}</td>
-          <td>${s.price}</td>
+          <td class="key-metric">${s.price}</td>
         `;
         tbody.appendChild(tr);
       }
