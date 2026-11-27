@@ -27,8 +27,6 @@ MIN_AGE_DAYS_1D = 30
 MIN_ACTIVE_PAIRS_PER_BASE = 3
 TOP_GAINERS_LIMIT = 25
 
-CUSTOM_KEYS = ["CV1", "CICT", "CHB", "CPA"]
-
 EXCLUDED_BASES = {
     "USDT", "USDC", "USDS", "BUSD", "FDUSD", "TUSD", "USDP", "DAI",
     "UST", "USTC", "USDE", "USD1", "PYUSD", "USDD", "EUR", "TRY",
@@ -132,7 +130,7 @@ def fetch_json_with_fallback(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     preferred_url: Optional[str] = None,
-    timeout: int = 8,
+    timeout: int = 6,
 ):
     urls = list(BINANCE_ENDPOINTS)
     if preferred_url and preferred_url in urls:
@@ -161,7 +159,7 @@ def fetch_json_with_fallback(
 def get_spot_usdt_universe(
     session: requests.Session,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, int], str]:
-    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=10)
+    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=8)
     symbols_raw = info_data.get("symbols", [])
 
     base_pair_count: Dict[str, int] = {}
@@ -194,7 +192,7 @@ def get_spot_usdt_universe(
     vol_map: Dict[str, float] = {}
     try:
         tickers, working_url = fetch_json_with_fallback(
-            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=10
+            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=8
         )
         for t in tickers:
             sym = t.get("symbol", "")
@@ -221,7 +219,7 @@ def fetch_klines_df(
         "/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         preferred_url=base_url,
-        timeout=8,
+        timeout=6,
     )
     if not raw:
         return pd.DataFrame()
@@ -268,7 +266,6 @@ def _detect_trend_1h(df_1h: pd.DataFrame, lookback: int = 36) -> Optional[str]:
     return None
 
 
-# --- BASE SCANNERS (ALWAYS RUN AUTOMATICALLY) ---
 def check_v1_rule(df_1h: pd.DataFrame, df_1d: pd.DataFrame):
     if not _trend_up(df_1h) or not _trend_up(df_1d):
         return None
@@ -351,7 +348,6 @@ def is_established_non_delisting_coin(df_1d: pd.DataFrame, pair_count: int) -> b
     return True
 
 
-# --- CUSTOM SCANNERS (ONLY RUN WHEN STARTED BY USER; PERSIST UNTIL CLEAR) ---
 def check_custom_v1(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFrame):
     if not _trend_up(df_1h) or not _trend_up(df_1d) or df_30m.empty or len(df_30m) < 25:
         return None
@@ -361,9 +357,7 @@ def check_custom_v1(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFra
         return None
     if not (53.0 <= rsi_1h <= 57.0) or not (rsi_30m > rsi_1h):
         return None
-    ha_1h_green = smoothed_heikin_ashi_green(df_1h, 6)
-    ha_30m_green = smoothed_heikin_ashi_green(df_30m, 6)
-    if ha_1h_green is not True or ha_30m_green is not True:
+    if smoothed_heikin_ashi_green(df_1h, 6) is not True or smoothed_heikin_ashi_green(df_30m, 6) is not True:
         return None
     price = float(df_1h["close"].iloc[-1])
     return {
@@ -579,7 +573,6 @@ def _scan_symbol(
         df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250) if need_1d else pd.DataFrame()
         df_30m = fetch_klines_df(shared_session, symbol, base_url, "30m", 100) if need_30m else pd.DataFrame()
 
-        # Base scanners (always active)
         if need_v1_1d:
             s = check_v1_rule(df_1h, df_1d)
             if s:
@@ -606,7 +599,6 @@ def _scan_symbol(
                 "price": f"{price:.8f}".rstrip("0").rstrip("."),
             }
 
-        # Custom scanners (only when enabled)
         if c_v1:
             cs = check_custom_v1(df_1h, df_1d, df_30m)
             if cs:
@@ -673,7 +665,7 @@ def _bg_loop() -> None:
                 for sym, chg in sorted(change_pct_map.items(), key=lambda kv: kv[1], reverse=True)
                 if chg > 0.0 and pair_counts_map.get(sym, 0) >= MIN_ACTIVE_PAIRS_PER_BASE
             ]
-            top_mover_candidates = set(top_movers[:60])
+            top_mover_candidates = set(top_movers[:50])
 
             with _lock:
                 prune_base_signals_locked(time.time())
@@ -685,7 +677,7 @@ def _bg_loop() -> None:
                 SCAN_STATUS["owner"] = OWNER_LABEL
 
             cycle_gainers: List[Dict[str, Any]] = []
-            with ThreadPoolExecutor(max_workers=12) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = [
                     pool.submit(
                         _scan_symbol,
@@ -911,7 +903,6 @@ HTML_PAGE = """<!DOCTYPE html>
       letter-spacing: 0.8px;
       color: #34d399;
     }
-
     .custom-box {
       background: #090e1a;
       border: 1px solid #1f2d46;
@@ -979,7 +970,6 @@ HTML_PAGE = """<!DOCTYPE html>
       background: #ef4444;
       color: #ffffff;
     }
-
     .section-row {
       background: #090d16;
       border: 1px solid #1e293b;
@@ -1001,10 +991,10 @@ HTML_PAGE = """<!DOCTYPE html>
       font-weight: 800;
       letter-spacing: 1px;
     }
-    .t-V1, .t-CV1 { color: #34d399; }
-    .t-HB, .t-CHB { color: #60a5fa; }
-    .t-PA, .t-CPA { color: #c084fc; }
-    .t-ICT, .t-CICT { color: #fbbf24; }
+    .t-V1 { color: #34d399; }
+    .t-HB { color: #60a5fa; }
+    .t-PA { color: #c084fc; }
+    .t-ICT { color: #fbbf24; }
     .t-GN { color: #4ade80; }
     .section-cnt {
       font-size: 12px;
@@ -1084,7 +1074,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="main-layout">
       <div class="stack-list">
-        <!-- Baad wale custom scanners ka Start & Clear control sirf inhi ke liye -->
         <div class="custom-box">
           <div class="mini-tabs">
             <button class="mini-tab" id="tab-CV1" onclick="selectCustom('CV1')">V1 (SHA+RSI)</button>
@@ -1105,7 +1094,6 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="coin-strip" id="list-CUSTOM"></div>
         </div>
 
-        <!-- Pehle wale scanners (always running automatically) -->
         <div class="section-row">
           <div class="section-head">
             <span class="section-title t-V1">V1 METHOD</span>
