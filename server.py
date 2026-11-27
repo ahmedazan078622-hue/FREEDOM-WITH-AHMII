@@ -96,7 +96,7 @@ def fetch_json_with_fallback(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     preferred_url: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = 8,
 ):
     urls = list(BINANCE_ENDPOINTS)
     if preferred_url and preferred_url in urls:
@@ -125,13 +125,7 @@ def fetch_json_with_fallback(
 def get_spot_usdt_universe(
     session: requests.Session,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, int], str]:
-    """
-    Fetch active Binance Spot USDT symbols that:
-    - have >= 3 active trading pairs on Binance Spot
-    - are not excluded/leveraged/delisting-risk tokens
-    Also return 24h price change % map and pair counts.
-    """
-    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=12)
+    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=10)
     symbols_raw = info_data.get("symbols", [])
 
     base_pair_count: Dict[str, int] = {}
@@ -164,7 +158,7 @@ def get_spot_usdt_universe(
     vol_map: Dict[str, float] = {}
     try:
         tickers, working_url = fetch_json_with_fallback(
-            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=12
+            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=10
         )
         for t in tickers:
             sym = t.get("symbol", "")
@@ -191,7 +185,7 @@ def fetch_klines_df(
         "/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         preferred_url=base_url,
-        timeout=10,
+        timeout=8,
     )
     if not raw:
         return pd.DataFrame()
@@ -316,12 +310,6 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
 
 
 def is_established_non_delisting_coin(df_1d: pd.DataFrame, pair_count: int) -> bool:
-    """
-    Verify:
-    - Not a new coin (at least MIN_AGE_DAYS_1D daily candles available)
-    - Active on >= 3 trading pairs
-    - Healthy recent daily activity (no zero-volume/dead delisting pattern)
-    """
     if pair_count < MIN_ACTIVE_PAIRS_PER_BASE:
         return False
     if df_1d.empty or len(df_1d) < MIN_AGE_DAYS_1D:
@@ -338,6 +326,7 @@ def _scan_symbol(
     shared_session: requests.Session,
     change_pct_24h: float,
     pair_count: int,
+    check_gainer_1d: bool,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     if _stop_event.is_set() or not symbol.endswith("USDT"):
         return [], None
@@ -352,16 +341,17 @@ def _scan_symbol(
         rsi_1h_val = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
         trend_1h = _detect_trend_1h(df_1h)
 
-        need_1d = (
+        need_v1_1d = (
             not np.isnan(rsi_1h_val) and 53.0 <= rsi_1h_val <= 57.0 and _trend_up(df_1h)
-        ) or (change_pct_24h > 0.0 and pair_count >= MIN_ACTIVE_PAIRS_PER_BASE)
+        )
+        need_1d = need_v1_1d or check_gainer_1d
 
         df_1d = (
             fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
             if need_1d else pd.DataFrame()
         )
 
-        if not np.isnan(rsi_1h_val) and 53.0 <= rsi_1h_val <= 57.0 and _trend_up(df_1h):
+        if need_v1_1d:
             sig_v1 = check_v1_rule(df_1h, df_1d)
             if sig_v1:
                 found.append(sig_v1)
@@ -380,7 +370,7 @@ def _scan_symbol(
         if sig_ict:
             found.append(sig_ict)
 
-        if change_pct_24h > 0.0 and is_established_non_delisting_coin(df_1d, pair_count):
+        if check_gainer_1d and is_established_non_delisting_coin(df_1d, pair_count):
             price = float(df_1h["close"].iloc[-1])
             gainer_candidate = {
                 "scanner": "GN",
@@ -411,6 +401,15 @@ def _scan_symbol(
         return found, None
 
 
+def _sync_gainers_locked(gainers: List[Dict[str, Any]], now_ts: float) -> None:
+    global LATEST_SIGNALS
+    gainers_sorted = sorted(gainers, key=lambda x: float(x.get("change_pct", 0.0)), reverse=True)[:TOP_GAINERS_LIMIT]
+    LATEST_SIGNALS = [s for s in LATEST_SIGNALS if s.get("scanner") != "GN"]
+    for g in reversed(gainers_sorted):
+        LATEST_SIGNALS.insert(0, g)
+    prune_expired_signals_locked(now_ts)
+
+
 def _bg_loop() -> None:
     session = requests.Session()
     cached_symbols: List[str] = []
@@ -426,6 +425,13 @@ def _bg_loop() -> None:
                 cached_symbols, change_pct_map, pair_counts_map, working_url = get_spot_usdt_universe(session)
                 last_sym_fetch = time.time()
 
+            top_movers = {
+                sym
+                for sym, chg in sorted(change_pct_map.items(), key=lambda kv: kv[1], reverse=True)
+                if chg > 0.0 and pair_counts_map.get(sym, 0) >= MIN_ACTIVE_PAIRS_PER_BASE
+            }
+            top_mover_candidates = set(list(sorted(top_movers, key=lambda s: change_pct_map.get(s, 0.0), reverse=True))[:60])
+
             with _lock:
                 prune_expired_signals_locked(time.time())
                 SCAN_STATUS["running"] = True
@@ -436,7 +442,7 @@ def _bg_loop() -> None:
                 SCAN_STATUS["owner"] = OWNER_LABEL
 
             cycle_gainers: List[Dict[str, Any]] = []
-            with ThreadPoolExecutor(max_workers=10) as pool:
+            with ThreadPoolExecutor(max_workers=16) as pool:
                 futures = [
                     pool.submit(
                         _scan_symbol,
@@ -445,6 +451,7 @@ def _bg_loop() -> None:
                         session,
                         change_pct_map.get(sym, 0.0),
                         pair_counts_map.get(sym, 0),
+                        sym in top_mover_candidates,
                     )
                     for sym in cached_symbols
                 ]
@@ -464,16 +471,13 @@ def _bg_loop() -> None:
                                 ALERT_HISTORY[cd_key] = now_ts
                                 LATEST_SIGNALS.insert(0, item)
                                 del LATEST_SIGNALS[500:]
+                        if g_cand:
+                            _sync_gainers_locked(cycle_gainers, now_ts)
                         SCAN_STATUS["scanned"] += 1
 
-            cycle_gainers.sort(key=lambda x: float(x.get("change_pct", 0.0)), reverse=True)
-            top_gainers = cycle_gainers[:TOP_GAINERS_LIMIT]
             now_ts = time.time()
             with _lock:
-                LATEST_SIGNALS = [s for s in LATEST_SIGNALS if s.get("scanner") != "GN"]
-                for g in reversed(top_gainers):
-                    LATEST_SIGNALS.insert(0, g)
-                prune_expired_signals_locked(now_ts)
+                _sync_gainers_locked(cycle_gainers, now_ts)
                 SCAN_STATUS["last_cycle"] = format_pkt_time(datetime.now(timezone.utc))
         except Exception:
             pass
