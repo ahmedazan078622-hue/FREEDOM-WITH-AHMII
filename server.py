@@ -2,7 +2,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,7 +19,15 @@ BINANCE_ENDPOINTS = [
 ]
 OWNER_LABEL = "03254112787"
 PKT_TZ = timezone(timedelta(hours=5))
+
+SIGNAL_TTL_SECONDS = 60 * 60
+ALERT_COOLDOWN_SECONDS = 900
 SYMBOL_REFRESH_SECONDS = 900
+MIN_AGE_DAYS_1D = 30
+MIN_ACTIVE_PAIRS_PER_BASE = 3
+TOP_GAINERS_LIMIT = 25
+
+CUSTOM_KEYS = ["CV1", "CICT", "CHB", "CPA"]
 
 EXCLUDED_BASES = {
     "USDT", "USDC", "USDS", "BUSD", "FDUSD", "TUSD", "USDP", "DAI",
@@ -35,14 +43,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LATEST_SIGNALS: List[Dict[str, Any]] = []
-PA_LAST_SIGNAL_PRICE: Dict[str, float] = {}
-SCANNER_ENABLED: Dict[str, bool] = {
-    "V1": False,
-    "ICT": False,
-    "HB": False,
-    "PA": False,
+BASE_SIGNALS: List[Dict[str, Any]] = []
+CUSTOM_SIGNALS: List[Dict[str, Any]] = []
+ALERT_HISTORY: Dict[str, float] = {}
+CPA_LAST_PRICE: Dict[str, float] = {}
+
+CUSTOM_ENABLED: Dict[str, bool] = {
+    "CV1": False,
+    "CICT": False,
+    "CHB": False,
+    "CPA": False,
 }
+
 SCAN_STATUS: Dict[str, Any] = {
     "running": False,
     "last_cycle": None,
@@ -57,14 +69,22 @@ _lock = threading.Lock()
 _stop_event = threading.Event()
 
 
-class ControlPayload(BaseModel):
+class CustomControlPayload(BaseModel):
     scanner: Optional[str] = None
     enabled: Optional[bool] = None
-    clear_all: bool = False
+    clear_custom: bool = False
 
 
 def format_pkt_time(dt_utc: datetime) -> str:
     return dt_utc.astimezone(PKT_TZ).strftime("%H:%M:%S PKT")
+
+
+def prune_base_signals_locked(now_ts: float) -> None:
+    global BASE_SIGNALS
+    BASE_SIGNALS = [
+        s for s in BASE_SIGNALS
+        if (now_ts - float(s.get("created_ts", now_ts))) <= SIGNAL_TTL_SECONDS
+    ]
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -90,22 +110,21 @@ def ema_list(values: List[float], length: int) -> List[float]:
     return out
 
 
-def smoothed_heikin_ashi(df: pd.DataFrame, smooth_len: int = 6) -> pd.DataFrame:
+def smoothed_heikin_ashi_green(df: pd.DataFrame, smooth_len: int = 6) -> Optional[bool]:
     if df.empty or len(df) < smooth_len + 2:
-        return pd.DataFrame()
+        return None
     s_open = df["open"].ewm(span=smooth_len, adjust=False).mean()
     s_high = df["high"].ewm(span=smooth_len, adjust=False).mean()
     s_low = df["low"].ewm(span=smooth_len, adjust=False).mean()
     s_close = df["close"].ewm(span=smooth_len, adjust=False).mean()
 
     ha_close = (s_open + s_high + s_low + s_close) / 4.0
+    hc_arr = ha_close.to_numpy(dtype=float)
     ha_open = np.empty(len(df), dtype=float)
     ha_open[0] = (float(s_open.iloc[0]) + float(s_close.iloc[0])) / 2.0
-    hc_arr = ha_close.to_numpy(dtype=float)
     for i in range(1, len(df)):
         ha_open[i] = (ha_open[i - 1] + hc_arr[i - 1]) / 2.0
-
-    return pd.DataFrame({"is_green": hc_arr > ha_open}, index=df.index)
+    return bool(hc_arr[-1] > ha_open[-1])
 
 
 def fetch_json_with_fallback(
@@ -113,7 +132,7 @@ def fetch_json_with_fallback(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     preferred_url: Optional[str] = None,
-    timeout: int = 6,
+    timeout: int = 8,
 ):
     urls = list(BINANCE_ENDPOINTS)
     if preferred_url and preferred_url in urls:
@@ -139,13 +158,26 @@ def fetch_json_with_fallback(
     raise RuntimeError(str(last_error or "All endpoints failed"))
 
 
-def get_spot_usdt_symbols(session: requests.Session):
-    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=8)
+def get_spot_usdt_universe(
+    session: requests.Session,
+) -> Tuple[List[str], Dict[str, float], Dict[str, int], str]:
+    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=10)
+    symbols_raw = info_data.get("symbols", [])
+
+    base_pair_count: Dict[str, int] = {}
+    for s in symbols_raw:
+        if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed") is True:
+            b = s.get("baseAsset", "")
+            if b:
+                base_pair_count[b] = base_pair_count.get(b, 0) + 1
+
     valid_spot: Set[str] = set()
-    for s in info_data.get("symbols", []):
+    pair_counts_map: Dict[str, int] = {}
+    for s in symbols_raw:
         base = s.get("baseAsset", "")
         quote = s.get("quoteAsset", "")
         sym = s.get("symbol", "")
+        p_cnt = base_pair_count.get(base, 0)
         if (
             quote == "USDT"
             and sym.endswith("USDT")
@@ -153,13 +185,17 @@ def get_spot_usdt_symbols(session: requests.Session):
             and s.get("isSpotTradingAllowed") is True
             and base not in EXCLUDED_BASES
             and not any(base.endswith(x) for x in ("UP", "DOWN", "BULL", "BEAR"))
+            and p_cnt >= MIN_ACTIVE_PAIRS_PER_BASE
         ):
             valid_spot.add(sym)
+            pair_counts_map[sym] = p_cnt
+
+    change_pct_map: Dict[str, float] = {}
+    vol_map: Dict[str, float] = {}
     try:
         tickers, working_url = fetch_json_with_fallback(
-            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=8
+            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=10
         )
-        vol_map: Dict[str, float] = {}
         for t in tickers:
             sym = t.get("symbol", "")
             if sym in valid_spot:
@@ -167,9 +203,14 @@ def get_spot_usdt_symbols(session: requests.Session):
                     vol_map[sym] = float(t.get("quoteVolume", 0.0))
                 except ValueError:
                     vol_map[sym] = 0.0
-        return sorted(valid_spot, key=lambda x: vol_map.get(x, 0.0), reverse=True), working_url
+                try:
+                    change_pct_map[sym] = float(t.get("priceChangePercent", 0.0))
+                except ValueError:
+                    change_pct_map[sym] = 0.0
+        ordered = sorted(valid_spot, key=lambda x: vol_map.get(x, 0.0), reverse=True)
+        return ordered, change_pct_map, pair_counts_map, working_url
     except Exception:
-        return sorted(valid_spot), working_url
+        return sorted(valid_spot), change_pct_map, pair_counts_map, working_url
 
 
 def fetch_klines_df(
@@ -180,7 +221,7 @@ def fetch_klines_df(
         "/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         preferred_url=base_url,
-        timeout=6,
+        timeout=8,
     )
     if not raw:
         return pd.DataFrame()
@@ -227,38 +268,44 @@ def _detect_trend_1h(df_1h: pd.DataFrame, lookback: int = 36) -> Optional[str]:
     return None
 
 
-def check_v1_rule(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFrame):
+# --- BASE SCANNERS (ALWAYS RUN AUTOMATICALLY) ---
+def check_v1_rule(df_1h: pd.DataFrame, df_1d: pd.DataFrame):
     if not _trend_up(df_1h) or not _trend_up(df_1d):
         return None
-    if df_30m.empty or len(df_30m) < 25:
-        return None
-
     rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
-    rsi_30m = float(calculate_rsi(df_30m["close"], 14).iloc[-1])
-    if np.isnan(rsi_1h) or np.isnan(rsi_30m):
+    if np.isnan(rsi_1h) or not (53.0 <= rsi_1h <= 57.0):
         return None
-    if not (53.0 <= rsi_1h <= 57.0) or not (rsi_30m > rsi_1h):
-        return None
-
-    ha_1h = smoothed_heikin_ashi(df_1h, smooth_len=6)
-    ha_30m = smoothed_heikin_ashi(df_30m, smooth_len=6)
-    if ha_1h.empty or ha_30m.empty:
-        return None
-    if not bool(ha_1h["is_green"].iloc[-1]) or not bool(ha_30m["is_green"].iloc[-1]):
-        return None
-
     price = float(df_1h["close"].iloc[-1])
     return {
         "scanner": "V1",
         "timeframe": "60",
+        "metric": f"1H RSI {rsi_1h:.1f}",
+        "detail": "1D+1H UP",
         "price": f"{price:.8f}".rstrip("0").rstrip("."),
-        "metric": f"1H RSI {rsi_1h:.1f} · 30m {rsi_30m:.1f}",
-        "detail": "1D+1H UP · 1H+30m SHA Green · 30m RSI>1H",
     }
 
 
-def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
-    if df_1h.empty or len(df_1h) < 40 or trend_1h not in ("UP", "SIDEWAYS"):
+def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
+    if df_1h.empty or df_30m.empty or len(df_1h) < 30 or len(df_30m) < 30:
+        return None
+    rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    rsi_30m = float(calculate_rsi(df_30m["close"], 14).iloc[-1])
+    if np.isnan(rsi_1h) or np.isnan(rsi_30m):
+        return None
+    if not (25.0 <= rsi_1h <= 40.0) or not (rsi_30m > rsi_1h):
+        return None
+    price = float(df_1h["close"].iloc[-1])
+    return {
+        "scanner": "HB",
+        "timeframe": "30",
+        "metric": f"1H {rsi_1h:.1f} | 30m {rsi_30m:.1f}",
+        "detail": "30m > 1H",
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def check_pa_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
+    if df_1h.empty or len(df_1h) < 30 or trend_1h not in ("UP", "SIDEWAYS"):
         return None
     rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
     if np.isnan(rsi_1h):
@@ -267,51 +314,64 @@ def check_pa_rule(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
         return None
     if trend_1h == "SIDEWAYS" and not (25.0 <= rsi_1h <= 40.0):
         return None
-
-    window = df_1h.iloc[-40:-1]
-    lows = window["low"].to_numpy(dtype=float)
-    highs = window["high"].to_numpy(dtype=float)
-    curr_price = float(df_1h["close"].iloc[-1])
-    curr_low = float(df_1h["low"].iloc[-1])
-    if curr_price <= 0:
-        return None
-
-    support_levels = [
-        float(lows[i]) for i in range(1, len(window) - 1)
-        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]
-    ]
-    resistance_levels = [
-        float(highs[i]) for i in range(1, len(window) - 1)
-        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]
-    ]
-    if not support_levels or not resistance_levels:
-        return None
-
-    strong_support = min(support_levels, key=lambda lv: abs(lv - curr_low))
-    strong_resistance = max(resistance_levels)
-    if strong_resistance <= strong_support:
-        return None
-
-    near_support = (curr_low <= strong_support * 1.006) and (curr_price >= strong_support * 0.992)
-    if not near_support:
-        return None
-
-    with _lock:
-        prev_sig_price = PA_LAST_SIGNAL_PRICE.get(symbol)
-        if prev_sig_price is not None and prev_sig_price > 0:
-            pump_pct = ((curr_price - prev_sig_price) / prev_sig_price) * 100.0
-            if pump_pct < 1.0:
-                return None
-        PA_LAST_SIGNAL_PRICE[symbol] = curr_price
-
+    price = float(df_1h["close"].iloc[-1])
     return {
         "scanner": "PA",
         "timeframe": "60",
-        "price": f"{curr_price:.8f}".rstrip("0").rstrip("."),
         "metric": f"{trend_1h} · RSI {rsi_1h:.1f}",
-        "detail": f"Sup {strong_support:.6f}".rstrip("0").rstrip(".")
-        + f" · Res {strong_resistance:.6f}".rstrip("0").rstrip(".")
-        + " · +1% Pump Rule",
+        "detail": "1H Zone",
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
+    if df_1h.empty or len(df_1h) < 30 or trend_1h != "SIDEWAYS":
+        return None
+    rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    if np.isnan(rsi_1h) or not (30.0 <= rsi_1h <= 40.0):
+        return None
+    price = float(df_1h["close"].iloc[-1])
+    return {
+        "scanner": "ICT",
+        "timeframe": "60",
+        "metric": f"SIDEWAYS · RSI {rsi_1h:.1f}",
+        "detail": "1H 30-40",
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def is_established_non_delisting_coin(df_1d: pd.DataFrame, pair_count: int) -> bool:
+    if pair_count < MIN_ACTIVE_PAIRS_PER_BASE:
+        return False
+    if df_1d.empty or len(df_1d) < MIN_AGE_DAYS_1D:
+        return False
+    recent_vols = df_1d["volume"].iloc[-7:].to_numpy(dtype=float)
+    if len(recent_vols) == 0 or np.any(recent_vols <= 0.0):
+        return False
+    return True
+
+
+# --- CUSTOM SCANNERS (ONLY RUN WHEN STARTED BY USER; PERSIST UNTIL CLEAR) ---
+def check_custom_v1(df_1h: pd.DataFrame, df_1d: pd.DataFrame, df_30m: pd.DataFrame):
+    if not _trend_up(df_1h) or not _trend_up(df_1d) or df_30m.empty or len(df_30m) < 25:
+        return None
+    rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    rsi_30m = float(calculate_rsi(df_30m["close"], 14).iloc[-1])
+    if np.isnan(rsi_1h) or np.isnan(rsi_30m):
+        return None
+    if not (53.0 <= rsi_1h <= 57.0) or not (rsi_30m > rsi_1h):
+        return None
+    ha_1h_green = smoothed_heikin_ashi_green(df_1h, 6)
+    ha_30m_green = smoothed_heikin_ashi_green(df_30m, 6)
+    if ha_1h_green is not True or ha_30m_green is not True:
+        return None
+    price = float(df_1h["close"].iloc[-1])
+    return {
+        "scanner": "CV1",
+        "timeframe": "60",
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+        "metric": f"1H RSI {rsi_1h:.1f} · 30m {rsi_30m:.1f}",
+        "detail": "1D+1H UP · 1H+30m SHA Green · 30m RSI>1H",
     }
 
 
@@ -330,10 +390,9 @@ def _no_body_touch_between(
     return True
 
 
-def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
+def check_custom_hb(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     if df_1h.empty or df_30m.empty or len(df_1h) < 40 or len(df_30m) < 25:
         return None
-
     rsi_1h_s = calculate_rsi(df_1h["close"], 14)
     rsi_30m_s = calculate_rsi(df_30m["close"], 14)
     rsi_1h = float(rsi_1h_s.iloc[-1])
@@ -362,7 +421,7 @@ def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
                 if _no_body_touch_between(opens, closes, prev_idx, curr_idx, prev_low, curr_low):
                     price = float(df_1h["close"].iloc[-1])
                     return {
-                        "scanner": "HB",
+                        "scanner": "CHB",
                         "timeframe": "60",
                         "price": f"{price:.8f}".rstrip("0").rstrip("."),
                         "metric": f"1H RSI {rsi_1h:.1f} · 30m {rsi_30m:.1f}",
@@ -371,7 +430,65 @@ def check_hb_rule(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     return None
 
 
-def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
+def check_custom_pa(symbol: str, df_1h: pd.DataFrame, trend_1h: Optional[str]):
+    if df_1h.empty or len(df_1h) < 40 or trend_1h not in ("UP", "SIDEWAYS"):
+        return None
+    rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    if np.isnan(rsi_1h):
+        return None
+    if trend_1h == "UP" and not (30.0 <= rsi_1h <= 40.0):
+        return None
+    if trend_1h == "SIDEWAYS" and not (25.0 <= rsi_1h <= 40.0):
+        return None
+
+    window = df_1h.iloc[-40:-1]
+    lows = window["low"].to_numpy(dtype=float)
+    highs = window["high"].to_numpy(dtype=float)
+    curr_price = float(df_1h["close"].iloc[-1])
+    curr_low = float(df_1h["low"].iloc[-1])
+    if curr_price <= 0:
+        return None
+
+    supports = [
+        float(lows[i]) for i in range(1, len(window) - 1)
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]
+    ]
+    resistances = [
+        float(highs[i]) for i in range(1, len(window) - 1)
+        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]
+    ]
+    if not supports or not resistances:
+        return None
+
+    strong_sup = min(supports, key=lambda lv: abs(lv - curr_low))
+    strong_res = max(resistances)
+    if strong_res <= strong_sup:
+        return None
+
+    near_sup = (curr_low <= strong_sup * 1.006) and (curr_price >= strong_sup * 0.992)
+    if not near_sup:
+        return None
+
+    with _lock:
+        prev_p = CPA_LAST_PRICE.get(symbol)
+        if prev_p is not None and prev_p > 0:
+            pump_pct = ((curr_price - prev_p) / prev_p) * 100.0
+            if pump_pct < 1.0:
+                return None
+        CPA_LAST_PRICE[symbol] = curr_price
+
+    return {
+        "scanner": "CPA",
+        "timeframe": "60",
+        "price": f"{curr_price:.8f}".rstrip("0").rstrip("."),
+        "metric": f"{trend_1h} · RSI {rsi_1h:.1f}",
+        "detail": f"Sup {strong_sup:.6f}".rstrip("0").rstrip(".")
+        + f" · Res {strong_res:.6f}".rstrip("0").rstrip(".")
+        + " · +1% Pump Rule",
+    }
+
+
+def check_custom_ict(df_1h: pd.DataFrame, trend_1h: Optional[str]):
     if df_1h.empty or len(df_1h) < 30 or trend_1h != "SIDEWAYS":
         return None
     rsi_1h = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
@@ -418,7 +535,7 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
 
     price = float(df_1h["close"].iloc[-1])
     return {
-        "scanner": "ICT",
+        "scanner": "CICT",
         "timeframe": "60",
         "price": f"{price:.8f}".rstrip("0").rstrip("."),
         "metric": f"SIDEWAYS · RSI {rsi_1h:.1f} · +{pump_pct:.2f}%",
@@ -426,117 +543,203 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
     }
 
 
-def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -> List[Dict[str, Any]]:
+def _scan_symbol(
+    symbol: str,
+    base_url: str,
+    shared_session: requests.Session,
+    change_pct_24h: float,
+    pair_count: int,
+    check_gainer_1d: bool,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     if _stop_event.is_set() or not symbol.endswith("USDT"):
-        return []
+        return [], None, []
 
     with _lock:
-        en_v1 = SCANNER_ENABLED["V1"]
-        en_ict = SCANNER_ENABLED["ICT"]
-        en_hb = SCANNER_ENABLED["HB"]
-        en_pa = SCANNER_ENABLED["PA"]
+        c_v1 = CUSTOM_ENABLED["CV1"]
+        c_ict = CUSTOM_ENABLED["CICT"]
+        c_hb = CUSTOM_ENABLED["CHB"]
+        c_pa = CUSTOM_ENABLED["CPA"]
 
-    if not (en_v1 or en_ict or en_hb or en_pa):
-        return []
+    base_found: List[Dict[str, Any]] = []
+    custom_found: List[Dict[str, Any]] = []
+    gainer_cand: Optional[Dict[str, Any]] = None
 
-    found: List[Dict[str, Any]] = []
     try:
         df_1h = fetch_klines_df(shared_session, symbol, base_url, "1h", 250)
         if df_1h.empty or len(df_1h) < 50:
-            return []
+            return [], None, []
 
-        trend_1h = _detect_trend_1h(df_1h) if (en_pa or en_ict) else None
-        df_30m = fetch_klines_df(shared_session, symbol, base_url, "30m", 100) if (en_v1 or en_hb) else pd.DataFrame()
-        df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250) if en_v1 else pd.DataFrame()
+        rsi_1h_val = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+        trend_1h = _detect_trend_1h(df_1h)
 
-        if en_v1:
-            sig = check_v1_rule(df_1h, df_1d, df_30m)
-            if sig:
-                found.append(sig)
-        if en_hb:
-            sig = check_hb_rule(df_1h, df_30m)
-            if sig:
-                found.append(sig)
-        if en_pa:
-            sig = check_pa_rule(symbol, df_1h, trend_1h)
-            if sig:
-                found.append(sig)
-        if en_ict:
-            sig = check_ict_rule(df_1h, trend_1h)
-            if sig:
-                found.append(sig)
+        need_v1_1d = (not np.isnan(rsi_1h_val) and 53.0 <= rsi_1h_val <= 57.0 and _trend_up(df_1h))
+        need_1d = need_v1_1d or check_gainer_1d or c_v1
+        need_30m = (not np.isnan(rsi_1h_val) and 25.0 <= rsi_1h_val <= 40.0) or c_v1 or c_hb
+
+        df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250) if need_1d else pd.DataFrame()
+        df_30m = fetch_klines_df(shared_session, symbol, base_url, "30m", 100) if need_30m else pd.DataFrame()
+
+        # Base scanners (always active)
+        if need_v1_1d:
+            s = check_v1_rule(df_1h, df_1d)
+            if s:
+                base_found.append(s)
+        if not np.isnan(rsi_1h_val) and 25.0 <= rsi_1h_val <= 40.0:
+            s = check_hb_rule(df_1h, df_30m)
+            if s:
+                base_found.append(s)
+        s = check_pa_rule(df_1h, trend_1h)
+        if s:
+            base_found.append(s)
+        s = check_ict_rule(df_1h, trend_1h)
+        if s:
+            base_found.append(s)
+
+        if check_gainer_1d and is_established_non_delisting_coin(df_1d, pair_count):
+            price = float(df_1h["close"].iloc[-1])
+            gainer_cand = {
+                "scanner": "GN",
+                "timeframe": "240",
+                "change_pct": change_pct_24h,
+                "metric": f"+{change_pct_24h:.2f}% 24h",
+                "detail": f"{pair_count} Pairs · {len(df_1d)}d",
+                "price": f"{price:.8f}".rstrip("0").rstrip("."),
+            }
+
+        # Custom scanners (only when enabled)
+        if c_v1:
+            cs = check_custom_v1(df_1h, df_1d, df_30m)
+            if cs:
+                custom_found.append(cs)
+        if c_ict:
+            cs = check_custom_ict(df_1h, trend_1h)
+            if cs:
+                custom_found.append(cs)
+        if c_hb:
+            cs = check_custom_hb(df_1h, df_30m)
+            if cs:
+                custom_found.append(cs)
+        if c_pa:
+            cs = check_custom_pa(symbol, df_1h, trend_1h)
+            if cs:
+                custom_found.append(cs)
 
         now_dt = datetime.now(timezone.utc)
         now_str = format_pkt_time(now_dt)
         now_ts = now_dt.timestamp()
-        for item in found:
+        for item in base_found + custom_found:
             item["symbol"] = symbol
             item["market"] = MARKET_TYPE
             item["detected_at"] = now_str
             item["created_ts"] = now_ts
-        return found
+
+        if gainer_cand:
+            gainer_cand["symbol"] = symbol
+            gainer_cand["market"] = MARKET_TYPE
+            gainer_cand["detected_at"] = now_str
+            gainer_cand["created_ts"] = now_ts
+
+        return base_found, gainer_cand, custom_found
     except Exception:
-        return found
+        return base_found, None, custom_found
+
+
+def _sync_gainers_locked(gainers: List[Dict[str, Any]], now_ts: float) -> None:
+    global BASE_SIGNALS
+    gainers_sorted = sorted(gainers, key=lambda x: float(x.get("change_pct", 0.0)), reverse=True)[:TOP_GAINERS_LIMIT]
+    BASE_SIGNALS = [s for s in BASE_SIGNALS if s.get("scanner") != "GN"]
+    for g in reversed(gainers_sorted):
+        BASE_SIGNALS.insert(0, g)
+    prune_base_signals_locked(now_ts)
 
 
 def _bg_loop() -> None:
     session = requests.Session()
     cached_symbols: List[str] = []
+    change_pct_map: Dict[str, float] = {}
+    pair_counts_map: Dict[str, int] = {}
     last_sym_fetch = 0.0
     working_url = BINANCE_ENDPOINTS[0]
 
     while not _stop_event.is_set():
         try:
-            with _lock:
-                any_enabled = any(SCANNER_ENABLED.values())
-                SCAN_STATUS["running"] = any_enabled
-                SCAN_STATUS["market"] = MARKET_TYPE
-                SCAN_STATUS["owner"] = OWNER_LABEL
-
-            if not any_enabled:
-                time.sleep(1)
-                continue
-
             now = time.time()
             if not cached_symbols or (now - last_sym_fetch) >= SYMBOL_REFRESH_SECONDS:
-                cached_symbols, working_url = get_spot_usdt_symbols(session)
+                cached_symbols, change_pct_map, pair_counts_map, working_url = get_spot_usdt_universe(session)
                 last_sym_fetch = time.time()
 
+            top_movers = [
+                sym
+                for sym, chg in sorted(change_pct_map.items(), key=lambda kv: kv[1], reverse=True)
+                if chg > 0.0 and pair_counts_map.get(sym, 0) >= MIN_ACTIVE_PAIRS_PER_BASE
+            ]
+            top_mover_candidates = set(top_movers[:60])
+
             with _lock:
+                prune_base_signals_locked(time.time())
+                SCAN_STATUS["running"] = True
                 SCAN_STATUS["scanned"] = 0
                 SCAN_STATUS["total"] = len(cached_symbols)
+                SCAN_STATUS["market"] = MARKET_TYPE
                 SCAN_STATUS["working_url"] = working_url
+                SCAN_STATUS["owner"] = OWNER_LABEL
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = [pool.submit(_scan_symbol, sym, working_url, session) for sym in cached_symbols]
+            cycle_gainers: List[Dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                futures = [
+                    pool.submit(
+                        _scan_symbol,
+                        sym,
+                        working_url,
+                        session,
+                        change_pct_map.get(sym, 0.0),
+                        pair_counts_map.get(sym, 0),
+                        sym in top_mover_candidates,
+                    )
+                    for sym in cached_symbols
+                ]
                 for fut in as_completed(futures):
                     if _stop_event.is_set():
                         break
+                    b_list, g_cand, c_list = fut.result()
+                    if g_cand:
+                        cycle_gainers.append(g_cand)
+
+                    now_ts = time.time()
                     with _lock:
-                        if not any(SCANNER_ENABLED.values()):
-                            break
-                    res_list = fut.result()
-                    with _lock:
-                        for item in res_list:
+                        prune_base_signals_locked(now_ts)
+                        for item in b_list:
+                            cd_key = f"B:{item['scanner']}:{item['symbol']}"
+                            if (now_ts - ALERT_HISTORY.get(cd_key, 0.0)) >= ALERT_COOLDOWN_SECONDS:
+                                ALERT_HISTORY[cd_key] = now_ts
+                                BASE_SIGNALS.insert(0, item)
+                                del BASE_SIGNALS[500:]
+                        for c_item in c_list:
                             dup = any(
-                                s.get("scanner") == item["scanner"]
-                                and s.get("symbol") == item["symbol"]
-                                and s.get("metric") == item["metric"]
-                                for s in LATEST_SIGNALS[:30]
+                                s.get("scanner") == c_item["scanner"]
+                                and s.get("symbol") == c_item["symbol"]
+                                and s.get("metric") == c_item["metric"]
+                                for s in CUSTOM_SIGNALS[:30]
                             )
                             if not dup:
-                                LATEST_SIGNALS.insert(0, item)
-                                del LATEST_SIGNALS[1000:]
+                                CUSTOM_SIGNALS.insert(0, c_item)
+                                del CUSTOM_SIGNALS[1000:]
+                        if g_cand:
+                            _sync_gainers_locked(cycle_gainers, now_ts)
                         SCAN_STATUS["scanned"] += 1
 
+            now_ts = time.time()
             with _lock:
+                _sync_gainers_locked(cycle_gainers, now_ts)
                 SCAN_STATUS["last_cycle"] = format_pkt_time(datetime.now(timezone.utc))
         except Exception:
             pass
 
-        for _ in range(3):
+        for _ in range(5):
             if _stop_event.is_set():
                 break
+            with _lock:
+                prune_base_signals_locked(time.time())
             time.sleep(1)
 
     with _lock:
@@ -557,29 +760,30 @@ def on_shutdown() -> None:
 
 @app.get("/api/signals")
 def get_signals():
+    now_ts = time.time()
     with _lock:
+        prune_base_signals_locked(now_ts)
         return {
             "status": dict(SCAN_STATUS),
-            "enabled": dict(SCANNER_ENABLED),
-            "signals": list(LATEST_SIGNALS),
+            "custom_enabled": dict(CUSTOM_ENABLED),
+            "base_signals": list(BASE_SIGNALS),
+            "custom_signals": list(CUSTOM_SIGNALS),
         }
 
 
-@app.post("/api/control")
-def control_scanners(payload: ControlPayload):
+@app.post("/api/custom-control")
+def custom_control(payload: CustomControlPayload):
     with _lock:
-        if payload.clear_all:
-            LATEST_SIGNALS.clear()
-            PA_LAST_SIGNAL_PRICE.clear()
-        if payload.scanner in SCANNER_ENABLED and payload.enabled is not None:
-            SCANNER_ENABLED[payload.scanner] = bool(payload.enabled)
-            SCAN_STATUS["running"] = any(SCANNER_ENABLED.values())
+        if payload.clear_custom:
+            CUSTOM_SIGNALS.clear()
+            CPA_LAST_PRICE.clear()
+        if payload.scanner in CUSTOM_ENABLED and payload.enabled is not None:
+            CUSTOM_ENABLED[payload.scanner] = bool(payload.enabled)
         return JSONResponse(
             {
                 "ok": True,
-                "status": dict(SCAN_STATUS),
-                "enabled": dict(SCANNER_ENABLED),
-                "signals_count": len(LATEST_SIGNALS),
+                "custom_enabled": dict(CUSTOM_ENABLED),
+                "custom_signals_count": len(CUSTOM_SIGNALS),
             }
         )
 
@@ -624,17 +828,6 @@ HTML_PAGE = """<!DOCTYPE html>
       align-items: center;
     }
     .status-line b { color: #38bdf8; }
-    .clear-btn {
-      background: #1e1318;
-      color: #fda4af;
-      border: 1px solid #881337;
-      border-radius: 7px;
-      padding: 5px 12px;
-      font-size: 12px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .clear-btn:hover { background: #3b0d1c; }
     .main-layout {
       display: flex;
       flex-direction: row;
@@ -718,10 +911,18 @@ HTML_PAGE = """<!DOCTYPE html>
       letter-spacing: 0.8px;
       color: #34d399;
     }
+
+    .custom-box {
+      background: #090e1a;
+      border: 1px solid #1f2d46;
+      border-radius: 12px;
+      padding: 14px;
+    }
     .mini-tabs {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+      align-items: center;
       margin-bottom: 10px;
     }
     .mini-tab {
@@ -732,7 +933,7 @@ HTML_PAGE = """<!DOCTYPE html>
       padding: 5px 10px;
       font-size: 11px;
       font-weight: 800;
-      letter-spacing: 0.6px;
+      letter-spacing: 0.5px;
       cursor: pointer;
     }
     .mini-tab.active {
@@ -740,11 +941,23 @@ HTML_PAGE = """<!DOCTYPE html>
       color: #34d399;
       background: #0d1f1b;
     }
+    .clear-btn {
+      background: #1e1318;
+      color: #fda4af;
+      border: 1px solid #881337;
+      border-radius: 7px;
+      padding: 5px 12px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-left: auto;
+    }
+    .clear-btn:hover { background: #3b0d1c; }
     .start-panel {
       background: #0b1220;
       border: 1px dashed #2b3d5c;
       border-radius: 10px;
-      padding: 14px 16px;
+      padding: 12px 14px;
       margin-bottom: 12px;
       display: flex;
       align-items: center;
@@ -757,16 +970,16 @@ HTML_PAGE = """<!DOCTYPE html>
       color: #04110c;
       border: none;
       border-radius: 8px;
-      padding: 8px 16px;
+      padding: 7px 14px;
       font-size: 12px;
       font-weight: 900;
       cursor: pointer;
-      letter-spacing: 0.6px;
     }
     .start-btn.running {
       background: #ef4444;
       color: #ffffff;
     }
+
     .section-row {
       background: #090d16;
       border: 1px solid #1e293b;
@@ -788,15 +1001,11 @@ HTML_PAGE = """<!DOCTYPE html>
       font-weight: 800;
       letter-spacing: 1px;
     }
-    .t-V1 { color: #34d399; }
-    .t-ICT { color: #fbbf24; }
-    .t-HB { color: #60a5fa; }
-    .t-PA { color: #c084fc; }
-    .sec-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
+    .t-V1, .t-CV1 { color: #34d399; }
+    .t-HB, .t-CHB { color: #60a5fa; }
+    .t-PA, .t-CPA { color: #c084fc; }
+    .t-ICT, .t-CICT { color: #fbbf24; }
+    .t-GN { color: #4ade80; }
     .section-cnt {
       font-size: 12px;
       font-weight: 700;
@@ -810,7 +1019,7 @@ HTML_PAGE = """<!DOCTYPE html>
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      min-height: 54px;
+      min-height: 50px;
       align-items: center;
     }
     .coin-box {
@@ -818,7 +1027,7 @@ HTML_PAGE = """<!DOCTYPE html>
       border: 1px solid #28354d;
       border-radius: 9px;
       padding: 8px 12px;
-      min-width: 170px;
+      min-width: 150px;
       max-width: 280px;
       cursor: pointer;
       user-select: none;
@@ -842,13 +1051,13 @@ HTML_PAGE = """<!DOCTYPE html>
     .coin-meta {
       font-size: 10.5px;
       color: #cbd5e1;
-      margin-top: 3px;
+      margin-top: 2px;
       line-height: 1.3;
     }
     .coin-time {
       font-size: 10px;
       color: #94a3b8;
-      margin-top: 3px;
+      margin-top: 2px;
     }
     .empty-msg {
       color: #64748b;
@@ -870,56 +1079,45 @@ HTML_PAGE = """<!DOCTYPE html>
         <span>Signals: <b id="stTotal">0</b></span>
         <span>Cycle: <b id="stCycle">--</b></span>
         <span>Click coin to open <b>TradingView</b></span>
-        <button class="clear-btn" onclick="clearAllSignals()">Clear Signals</button>
       </div>
     </div>
 
     <div class="main-layout">
       <div class="stack-list">
-        <div class="mini-tabs">
-          <button class="mini-tab" id="tab-V1" onclick="selectScanner('V1')">V1</button>
-          <button class="mini-tab" id="tab-ICT" onclick="selectScanner('ICT')">ICT</button>
-          <button class="mini-tab" id="tab-HB" onclick="selectScanner('HB')">HIDDEN BULLISH</button>
-          <button class="mini-tab" id="tab-PA" onclick="selectScanner('PA')">PRICE ACTION</button>
-        </div>
-
-        <div class="start-panel">
-          <div>
-            <b id="activeScannerLabel">V1</b> scanner:
-            <span id="activeScannerState" class="empty-msg">Stopped (Start Scan to run)</span>
+        <!-- Baad wale custom scanners ka Start & Clear control sirf inhi ke liye -->
+        <div class="custom-box">
+          <div class="mini-tabs">
+            <button class="mini-tab" id="tab-CV1" onclick="selectCustom('CV1')">V1 (SHA+RSI)</button>
+            <button class="mini-tab" id="tab-CICT" onclick="selectCustom('CICT')">ICT (TRENDLINE)</button>
+            <button class="mini-tab" id="tab-CHB" onclick="selectCustom('CHB')">HIDDEN BULLISH (SWING)</button>
+            <button class="mini-tab" id="tab-CPA" onclick="selectCustom('CPA')">PRICE ACTION (+1%)</button>
+            <button class="clear-btn" onclick="clearCustomSignals()">Clear Custom Signals</button>
           </div>
-          <button class="start-btn" id="toggleScanBtn" onclick="toggleActiveScanner()">Start Scan</button>
+
+          <div class="start-panel">
+            <div>
+              <b id="activeCustomLabel">V1 (SHA+RSI)</b>:
+              <span id="activeCustomState" class="empty-msg">Stopped — click Start Scan</span>
+            </div>
+            <button class="start-btn" id="toggleCustomBtn" onclick="toggleActiveCustom()">Start Scan</button>
+          </div>
+
+          <div class="coin-strip" id="list-CUSTOM"></div>
         </div>
 
+        <!-- Pehle wale scanners (always running automatically) -->
         <div class="section-row">
           <div class="section-head">
             <span class="section-title t-V1">V1 METHOD</span>
-            <div class="sec-actions">
-              <button class="start-btn" id="btn-V1" onclick="toggleScanner('V1')">Start Scan</button>
-              <span class="section-cnt" id="cnt-V1">0</span>
-            </div>
+            <span class="section-cnt" id="cnt-V1">0</span>
           </div>
           <div class="coin-strip" id="list-V1"></div>
         </div>
 
         <div class="section-row">
           <div class="section-head">
-            <span class="section-title t-ICT">ICT</span>
-            <div class="sec-actions">
-              <button class="start-btn" id="btn-ICT" onclick="toggleScanner('ICT')">Start Scan</button>
-              <span class="section-cnt" id="cnt-ICT">0</span>
-            </div>
-          </div>
-          <div class="coin-strip" id="list-ICT"></div>
-        </div>
-
-        <div class="section-row">
-          <div class="section-head">
             <span class="section-title t-HB">HIDDEN BULLISH</span>
-            <div class="sec-actions">
-              <button class="start-btn" id="btn-HB" onclick="toggleScanner('HB')">Start Scan</button>
-              <span class="section-cnt" id="cnt-HB">0</span>
-            </div>
+            <span class="section-cnt" id="cnt-HB">0</span>
           </div>
           <div class="coin-strip" id="list-HB"></div>
         </div>
@@ -927,12 +1125,25 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="section-row">
           <div class="section-head">
             <span class="section-title t-PA">PRICE ACTION</span>
-            <div class="sec-actions">
-              <button class="start-btn" id="btn-PA" onclick="toggleScanner('PA')">Start Scan</button>
-              <span class="section-cnt" id="cnt-PA">0</span>
-            </div>
+            <span class="section-cnt" id="cnt-PA">0</span>
           </div>
           <div class="coin-strip" id="list-PA"></div>
+        </div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-ICT">ICT</span>
+            <span class="section-cnt" id="cnt-ICT">0</span>
+          </div>
+          <div class="coin-strip" id="list-ICT"></div>
+        </div>
+
+        <div class="section-row">
+          <div class="section-head">
+            <span class="section-title t-GN">GAINERS</span>
+            <span class="section-cnt" id="cnt-GN">0</span>
+          </div>
+          <div class="coin-strip" id="list-GN"></div>
         </div>
       </div>
 
@@ -954,83 +1165,77 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <script>
-    const CODES = ["V1", "ICT", "HB", "PA"];
-    const NAMES = { V1: "V1", ICT: "ICT", HB: "HIDDEN BULLISH", PA: "PRICE ACTION" };
-    let selectedScanner = "V1";
-    let enabledMap = { V1: false, ICT: false, HB: false, PA: false };
+    const BASE_CODES = ["V1", "HB", "PA", "ICT", "GN"];
+    const CUSTOM_CODES = ["CV1", "CICT", "CHB", "CPA"];
+    const CUSTOM_NAMES = {
+      CV1: "V1 (SHA+RSI)",
+      CICT: "ICT (TRENDLINE)",
+      CHB: "HIDDEN BULLISH (SWING)",
+      CPA: "PRICE ACTION (+1%)"
+    };
 
-    function updateControlsUI() {
-      CODES.forEach(c => {
+    let selectedCustom = "CV1";
+    let customEnabled = { CV1: false, CICT: false, CHB: false, CPA: false };
+    let latestCustomSignals = [];
+
+    function updateCustomUI() {
+      CUSTOM_CODES.forEach(c => {
         const tab = document.getElementById(`tab-${c}`);
-        if (tab) tab.classList.toggle("active", c === selectedScanner);
-        const btn = document.getElementById(`btn-${c}`);
-        if (btn) {
-          const isOn = !!enabledMap[c];
-          btn.textContent = isOn ? "Stop Scan" : "Start Scan";
-          btn.classList.toggle("running", isOn);
-        }
+        if (tab) tab.classList.toggle("active", c === selectedCustom);
       });
-
-      const activeOn = !!enabledMap[selectedScanner];
-      document.getElementById("activeScannerLabel").textContent = NAMES[selectedScanner];
-      const stEl = document.getElementById("activeScannerState");
-      stEl.textContent = activeOn ? "Running (Binance Spot USDT)" : "Stopped — click Start Scan";
-      const mainBtn = document.getElementById("toggleScanBtn");
-      mainBtn.textContent = activeOn ? "Stop Scan" : "Start Scan";
-      mainBtn.classList.toggle("running", activeOn);
+      const isOn = !!customEnabled[selectedCustom];
+      document.getElementById("activeCustomLabel").textContent = CUSTOM_NAMES[selectedCustom];
+      document.getElementById("activeCustomState").textContent =
+        isOn ? "Running (Binance Spot USDT)" : "Stopped — click Start Scan";
+      const btn = document.getElementById("toggleCustomBtn");
+      btn.textContent = isOn ? "Stop Scan" : "Start Scan";
+      btn.classList.toggle("running", isOn);
+      renderCustomStrip();
     }
 
-    function selectScanner(code) {
-      selectedScanner = code;
-      updateControlsUI();
+    function selectCustom(code) {
+      selectedCustom = code;
+      updateCustomUI();
     }
 
-    async function setScannerState(code, enabled) {
-      enabledMap[code] = enabled;
-      updateControlsUI();
+    async function toggleActiveCustom() {
+      const nextState = !customEnabled[selectedCustom];
+      customEnabled[selectedCustom] = nextState;
+      updateCustomUI();
       try {
-        await fetch("/api/control", {
+        await fetch("/api/custom-control", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scanner: code, enabled })
+          body: JSON.stringify({ scanner: selectedCustom, enabled: nextState })
         });
       } catch (e) {}
       poll();
     }
 
-    function toggleScanner(code) {
-      setScannerState(code, !enabledMap[code]);
-    }
-
-    function toggleActiveScanner() {
-      toggleScanner(selectedScanner);
-    }
-
-    async function clearAllSignals() {
+    async function clearCustomSignals() {
       try {
-        await fetch("/api/control", {
+        await fetch("/api/custom-control", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ clear_all: true })
+          body: JSON.stringify({ clear_custom: true })
         });
       } catch (e) {}
       poll();
     }
 
-    function renderSection(code, items) {
-      const boxWrap = document.getElementById(`list-${code}`);
-      const cntEl = document.getElementById(`cnt-${code}`);
-      cntEl.textContent = String(items.length);
-      boxWrap.innerHTML = "";
-
+    function renderCustomStrip() {
+      const wrap = document.getElementById("list-CUSTOM");
+      const items = latestCustomSignals.filter(x => x.scanner === selectedCustom);
+      wrap.innerHTML = "";
       if (!items.length) {
         const em = document.createElement("div");
         em.className = "empty-msg";
-        em.textContent = enabledMap[code] ? "Scanning Spot USDT..." : "Click Start Scan to run";
-        boxWrap.appendChild(em);
+        em.textContent = customEnabled[selectedCustom]
+          ? "Scanning Spot USDT..."
+          : "Stopped — click Start Scan to run this scanner";
+        wrap.appendChild(em);
         return;
       }
-
       for (const s of items) {
         const card = document.createElement("div");
         card.className = "coin-box";
@@ -1046,6 +1251,38 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="coin-meta">${s.detail || ""}</div>
           <div class="coin-time">Time: ${s.detected_at || ""}</div>
         `;
+        wrap.appendChild(card);
+      }
+    }
+
+    function renderBaseSection(code, items) {
+      const boxWrap = document.getElementById(`list-${code}`);
+      const cntEl = document.getElementById(`cnt-${code}`);
+      cntEl.textContent = String(items.length);
+      boxWrap.innerHTML = "";
+
+      if (!items.length) {
+        const em = document.createElement("div");
+        em.className = "empty-msg";
+        em.textContent = "No coins yet";
+        boxWrap.appendChild(em);
+        return;
+      }
+
+      for (const s of items) {
+        const card = document.createElement("div");
+        card.className = "coin-box";
+        card.onclick = () => {
+          window.open(
+            `https://www.tradingview.com/chart/?symbol=BINANCE:${s.symbol}&interval=${s.timeframe || 60}`,
+            "_blank"
+          );
+        };
+        card.innerHTML = `
+          <div class="coin-sym">${s.symbol}</div>
+          <div class="coin-sub">${s.price || ""}</div>
+          <div class="coin-meta">${s.metric || ""} · ${s.detail || ""}</div>
+        `;
         boxWrap.appendChild(card);
       }
     }
@@ -1055,23 +1292,24 @@ HTML_PAGE = """<!DOCTYPE html>
         const r = await fetch("/api/signals");
         const d = await r.json();
         const st = d.status || {};
-        if (d.enabled) {
-          enabledMap = { ...enabledMap, ...d.enabled };
-          updateControlsUI();
+        if (d.custom_enabled) {
+          customEnabled = { ...customEnabled, ...d.custom_enabled };
         }
-        const all = d.signals || [];
+        const baseAll = d.base_signals || [];
+        latestCustomSignals = d.custom_signals || [];
 
         document.getElementById("stScan").textContent = `${st.scanned || 0}/${st.total || 0}`;
-        document.getElementById("stTotal").textContent = String(all.length);
+        document.getElementById("stTotal").textContent = String(baseAll.length + latestCustomSignals.length);
         document.getElementById("stCycle").textContent = st.last_cycle || "--";
 
-        CODES.forEach(c => {
-          renderSection(c, all.filter(x => x.scanner === c));
+        updateCustomUI();
+        BASE_CODES.forEach(c => {
+          renderBaseSection(c, baseAll.filter(x => x.scanner === c));
         });
       } catch (e) {}
     }
 
-    updateControlsUI();
+    updateCustomUI();
     poll();
     setInterval(poll, 2000);
   </script>
