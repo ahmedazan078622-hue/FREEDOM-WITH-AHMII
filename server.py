@@ -2,7 +2,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,9 @@ PKT_TZ = timezone(timedelta(hours=5))
 SIGNAL_TTL_SECONDS = 60 * 60
 ALERT_COOLDOWN_SECONDS = 900
 SYMBOL_REFRESH_SECONDS = 900
+MIN_AGE_DAYS_1D = 30
+MIN_ACTIVE_PAIRS_PER_BASE = 3
+TOP_GAINERS_LIMIT = 25
 
 EXCLUDED_BASES = {
     "USDT", "USDC", "USDS", "BUSD", "FDUSD", "TUSD", "USDP", "DAI",
@@ -119,14 +122,32 @@ def fetch_json_with_fallback(
     raise RuntimeError(str(last_error or "All endpoints failed"))
 
 
-def get_spot_usdt_symbols(session: requests.Session):
-    """Fetch only active Binance Spot USDT pairs."""
+def get_spot_usdt_universe(
+    session: requests.Session,
+) -> Tuple[List[str], Dict[str, float], Dict[str, int], str]:
+    """
+    Fetch active Binance Spot USDT symbols that:
+    - have >= 3 active trading pairs on Binance Spot
+    - are not excluded/leveraged/delisting-risk tokens
+    Also return 24h price change % map and pair counts.
+    """
     info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=12)
-    valid_spot = set()
-    for s in info_data.get("symbols", []):
+    symbols_raw = info_data.get("symbols", [])
+
+    base_pair_count: Dict[str, int] = {}
+    for s in symbols_raw:
+        if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed") is True:
+            b = s.get("baseAsset", "")
+            if b:
+                base_pair_count[b] = base_pair_count.get(b, 0) + 1
+
+    valid_spot: Set[str] = set()
+    pair_counts_map: Dict[str, int] = {}
+    for s in symbols_raw:
         base = s.get("baseAsset", "")
         quote = s.get("quoteAsset", "")
         sym = s.get("symbol", "")
+        p_cnt = base_pair_count.get(base, 0)
         if (
             quote == "USDT"
             and sym.endswith("USDT")
@@ -134,13 +155,17 @@ def get_spot_usdt_symbols(session: requests.Session):
             and s.get("isSpotTradingAllowed") is True
             and base not in EXCLUDED_BASES
             and not any(base.endswith(x) for x in ("UP", "DOWN", "BULL", "BEAR"))
+            and p_cnt >= MIN_ACTIVE_PAIRS_PER_BASE
         ):
             valid_spot.add(sym)
+            pair_counts_map[sym] = p_cnt
+
+    change_pct_map: Dict[str, float] = {}
+    vol_map: Dict[str, float] = {}
     try:
         tickers, working_url = fetch_json_with_fallback(
             session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=12
         )
-        vol_map = {}
         for t in tickers:
             sym = t.get("symbol", "")
             if sym in valid_spot:
@@ -148,9 +173,14 @@ def get_spot_usdt_symbols(session: requests.Session):
                     vol_map[sym] = float(t.get("quoteVolume", 0.0))
                 except ValueError:
                     vol_map[sym] = 0.0
-        return sorted(valid_spot, key=lambda x: vol_map.get(x, 0.0), reverse=True), working_url
+                try:
+                    change_pct_map[sym] = float(t.get("priceChangePercent", 0.0))
+                except ValueError:
+                    change_pct_map[sym] = 0.0
+        ordered = sorted(valid_spot, key=lambda x: vol_map.get(x, 0.0), reverse=True)
+        return ordered, change_pct_map, pair_counts_map, working_url
     except Exception:
-        return sorted(valid_spot), working_url
+        return sorted(valid_spot), change_pct_map, pair_counts_map, working_url
 
 
 def fetch_klines_df(
@@ -285,59 +315,53 @@ def check_ict_rule(df_1h: pd.DataFrame, trend_1h: Optional[str]):
     }
 
 
-def check_oc_gap_4h_rule(df_4h: pd.DataFrame):
-    """OC GAP: 4H timeframe par recent bullish open-close / imbalance gap."""
-    if df_4h.empty or len(df_4h) < 8:
-        return None
-    opens = df_4h["open"].to_numpy(dtype=float)
-    closes = df_4h["close"].to_numpy(dtype=float)
-    lows = df_4h["low"].to_numpy(dtype=float)
-    highs = df_4h["high"].to_numpy(dtype=float)
-    n = len(df_4h)
-    curr_price = closes[-1]
-    if curr_price <= 0:
-        return None
-
-    # Check last 5 4H candles for an active bullish OC gap / FVG
-    for idx in range(n - 1, max(2, n - 6), -1):
-        prev_close = closes[idx - 1]
-        c_open = opens[idx]
-        c_close = closes[idx]
-        if prev_close <= 0 or c_close <= c_open:
-            continue
-
-        oc_gap_pct = ((c_open - prev_close) / prev_close) * 100.0
-        fvg_gap_pct = ((lows[idx] - highs[idx - 2]) / max(highs[idx - 2], 1e-12)) * 100.0 if highs[idx - 2] < lows[idx] else 0.0
-
-        if oc_gap_pct >= 0.15 or fvg_gap_pct >= 0.15:
-            gap_val = max(oc_gap_pct, fvg_gap_pct)
-            zone_low = min(prev_close, c_open, lows[idx])
-            zone_high = max(prev_close, c_open, highs[idx])
-            if zone_low * 0.985 <= curr_price <= zone_high * 1.03:
-                return {
-                    "scanner": "OC",
-                    "timeframe": "240",
-                    "metric": f"4H Gap +{gap_val:.2f}%",
-                    "detail": f"Zone {zone_low:.6f}".rstrip("0").rstrip("."),
-                    "price": f"{curr_price:.8f}".rstrip("0").rstrip("."),
-                }
-    return None
+def is_established_non_delisting_coin(df_1d: pd.DataFrame, pair_count: int) -> bool:
+    """
+    Verify:
+    - Not a new coin (at least MIN_AGE_DAYS_1D daily candles available)
+    - Active on >= 3 trading pairs
+    - Healthy recent daily activity (no zero-volume/dead delisting pattern)
+    """
+    if pair_count < MIN_ACTIVE_PAIRS_PER_BASE:
+        return False
+    if df_1d.empty or len(df_1d) < MIN_AGE_DAYS_1D:
+        return False
+    recent_vols = df_1d["volume"].iloc[-7:].to_numpy(dtype=float)
+    if len(recent_vols) == 0 or np.any(recent_vols <= 0.0):
+        return False
+    return True
 
 
-def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -> List[Dict[str, Any]]:
+def _scan_symbol(
+    symbol: str,
+    base_url: str,
+    shared_session: requests.Session,
+    change_pct_24h: float,
+    pair_count: int,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     if _stop_event.is_set() or not symbol.endswith("USDT"):
-        return []
+        return [], None
     found: List[Dict[str, Any]] = []
+    gainer_candidate: Optional[Dict[str, Any]] = None
+
     try:
         df_1h = fetch_klines_df(shared_session, symbol, base_url, "1h", 250)
         if df_1h.empty or len(df_1h) < 50:
-            return []
+            return [], None
 
         rsi_1h_val = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
         trend_1h = _detect_trend_1h(df_1h)
 
+        need_1d = (
+            not np.isnan(rsi_1h_val) and 53.0 <= rsi_1h_val <= 57.0 and _trend_up(df_1h)
+        ) or (change_pct_24h > 0.0 and pair_count >= MIN_ACTIVE_PAIRS_PER_BASE)
+
+        df_1d = (
+            fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
+            if need_1d else pd.DataFrame()
+        )
+
         if not np.isnan(rsi_1h_val) and 53.0 <= rsi_1h_val <= 57.0 and _trend_up(df_1h):
-            df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
             sig_v1 = check_v1_rule(df_1h, df_1d)
             if sig_v1:
                 found.append(sig_v1)
@@ -356,10 +380,16 @@ def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -
         if sig_ict:
             found.append(sig_ict)
 
-        df_4h = fetch_klines_df(shared_session, symbol, base_url, "4h", 30)
-        sig_oc = check_oc_gap_4h_rule(df_4h)
-        if sig_oc:
-            found.append(sig_oc)
+        if change_pct_24h > 0.0 and is_established_non_delisting_coin(df_1d, pair_count):
+            price = float(df_1h["close"].iloc[-1])
+            gainer_candidate = {
+                "scanner": "GN",
+                "timeframe": "240",
+                "change_pct": change_pct_24h,
+                "metric": f"+{change_pct_24h:.2f}% 24h",
+                "detail": f"{pair_count} Pairs · {len(df_1d)}d",
+                "price": f"{price:.8f}".rstrip("0").rstrip("."),
+            }
 
         now_dt = datetime.now(timezone.utc)
         now_str = format_pkt_time(now_dt)
@@ -369,14 +399,23 @@ def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -
             item["market"] = MARKET_TYPE
             item["detected_at"] = now_str
             item["created_ts"] = now_ts
-        return found
+
+        if gainer_candidate:
+            gainer_candidate["symbol"] = symbol
+            gainer_candidate["market"] = MARKET_TYPE
+            gainer_candidate["detected_at"] = now_str
+            gainer_candidate["created_ts"] = now_ts
+
+        return found, gainer_candidate
     except Exception:
-        return found
+        return found, None
 
 
 def _bg_loop() -> None:
     session = requests.Session()
     cached_symbols: List[str] = []
+    change_pct_map: Dict[str, float] = {}
+    pair_counts_map: Dict[str, int] = {}
     last_sym_fetch = 0.0
     working_url = BINANCE_ENDPOINTS[0]
 
@@ -384,7 +423,7 @@ def _bg_loop() -> None:
         try:
             now = time.time()
             if not cached_symbols or (now - last_sym_fetch) >= SYMBOL_REFRESH_SECONDS:
-                cached_symbols, working_url = get_spot_usdt_symbols(session)
+                cached_symbols, change_pct_map, pair_counts_map, working_url = get_spot_usdt_universe(session)
                 last_sym_fetch = time.time()
 
             with _lock:
@@ -396,12 +435,26 @@ def _bg_loop() -> None:
                 SCAN_STATUS["working_url"] = working_url
                 SCAN_STATUS["owner"] = OWNER_LABEL
 
+            cycle_gainers: List[Dict[str, Any]] = []
             with ThreadPoolExecutor(max_workers=10) as pool:
-                futures = [pool.submit(_scan_symbol, sym, working_url, session) for sym in cached_symbols]
+                futures = [
+                    pool.submit(
+                        _scan_symbol,
+                        sym,
+                        working_url,
+                        session,
+                        change_pct_map.get(sym, 0.0),
+                        pair_counts_map.get(sym, 0),
+                    )
+                    for sym in cached_symbols
+                ]
                 for fut in as_completed(futures):
                     if _stop_event.is_set():
                         break
-                    res_list = fut.result()
+                    res_list, g_cand = fut.result()
+                    if g_cand:
+                        cycle_gainers.append(g_cand)
+
                     now_ts = time.time()
                     with _lock:
                         prune_expired_signals_locked(now_ts)
@@ -413,8 +466,14 @@ def _bg_loop() -> None:
                                 del LATEST_SIGNALS[500:]
                         SCAN_STATUS["scanned"] += 1
 
+            cycle_gainers.sort(key=lambda x: float(x.get("change_pct", 0.0)), reverse=True)
+            top_gainers = cycle_gainers[:TOP_GAINERS_LIMIT]
+            now_ts = time.time()
             with _lock:
-                prune_expired_signals_locked(time.time())
+                LATEST_SIGNALS = [s for s in LATEST_SIGNALS if s.get("scanner") != "GN"]
+                for g in reversed(top_gainers):
+                    LATEST_SIGNALS.insert(0, g)
+                prune_expired_signals_locked(now_ts)
                 SCAN_STATUS["last_cycle"] = format_pkt_time(datetime.now(timezone.utc))
         except Exception:
             pass
@@ -523,7 +582,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .t-HB { color: #60a5fa; }
     .t-PA { color: #c084fc; }
     .t-ICT { color: #fbbf24; }
-    .t-OC { color: #fb7185; }
+    .t-GN { color: #4ade80; }
     .section-cnt {
       font-size: 12px;
       font-weight: 700;
@@ -628,16 +687,16 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="section-row">
         <div class="section-head">
-          <span class="section-title t-OC">OC GAP</span>
-          <span class="section-cnt" id="cnt-OC">0</span>
+          <span class="section-title t-GN">GAINERS</span>
+          <span class="section-cnt" id="cnt-GN">0</span>
         </div>
-        <div class="coin-strip" id="list-OC"></div>
+        <div class="coin-strip" id="list-GN"></div>
       </div>
     </div>
   </div>
 
   <script>
-    const CODES = ["V1", "HB", "PA", "ICT", "OC"];
+    const CODES = ["V1", "HB", "PA", "ICT", "GN"];
     let seen = new Set();
     let fresh = new Set();
     let first = true;
