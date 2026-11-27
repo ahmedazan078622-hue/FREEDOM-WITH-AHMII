@@ -18,7 +18,7 @@ BINANCE_ENDPOINTS = [
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 
 OWNER_LABEL = "03254112787"
-SIGNAL_TTL_SECONDS = 20 * 60  # 20 minutes
+SIGNAL_TTL_SECONDS = 20 * 60
 ALERT_COOLDOWN_SECONDS = 900
 SYMBOL_REFRESH_SECONDS = 900
 
@@ -164,9 +164,6 @@ def fetch_klines_df(session: requests.Session, symbol: str, base_url: str, inter
     return df[["open", "high", "low", "close", "volume"]]
 
 
-# ==========================================
-# SCANNER 1: V1 METHOD
-# ==========================================
 def _trend_is_up_ema(df: pd.DataFrame) -> bool:
     if df.empty or len(df) < 208:
         return False
@@ -253,9 +250,6 @@ def check_v1_method(df_1h: pd.DataFrame, df_30m: pd.DataFrame, df_1d: pd.DataFra
     }
 
 
-# ==========================================
-# SCANNER 2: HIDEEN BULLISH
-# ==========================================
 def check_hideen_bullish(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     if df_1h.empty or df_30m.empty or len(df_1h) < 130 or len(df_30m) < 30:
         return None
@@ -324,9 +318,6 @@ def check_hideen_bullish(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
     return None
 
 
-# ==========================================
-# SCANNER 3: PRICE ACTION
-# ==========================================
 def _detect_1h_trend_pa(df_1h: pd.DataFrame, lookback: int = 36):
     if len(df_1h) < lookback + 5:
         return None
@@ -492,9 +483,6 @@ def check_price_action(df_1h: pd.DataFrame, df_30m: pd.DataFrame, df_12h: pd.Dat
     }
 
 
-# ==========================================
-# SCANNER 4: ICT
-# ==========================================
 def _is_sideways_ict(df: pd.DataFrame, anchor_idx: int) -> bool:
     end_idx = max(1, anchor_idx)
     start_idx = max(0, end_idx - 24)
@@ -739,4 +727,412 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>
+  <title>FREEDOM WITH AHMII | 4 Live Scanners</title>
+  <style>
+    :root {
+      --bg: #080d1a;
+      --card: #111827;
+      --head: #162033;
+      --border: #2b384f;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: radial-gradient(circle at top, #131e36 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .container { max-width: 1520px; margin: 0 auto; padding: 16px; }
+    .topbar {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+    }
+    .top-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      width: 100%;
+    }
+    .top-controls-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      width: 100%;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.9px;
+      background: linear-gradient(90deg, #34d399, #60a5fa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .brand p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+    .owner-pill {
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: #1d4ed8;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      margin-left: auto;
+    }
+    .meta-strip {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 13px;
+      color: #cbd5e1;
+      background: #0b1222;
+      padding: 8px 14px;
+      border-radius: 10px;
+      border: 1px solid #1e293b;
+    }
+    .meta-strip b { color: #34d399; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button {
+      border: 1px solid var(--border);
+      background: #1e293b;
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.15s;
+    }
+    button:hover { border-color: #60a5fa; }
+    button.active-green { background: #059669; border-color: #10b981; }
+    button.active-blue { background: #2563eb; border-color: #60a5fa; }
+
+    .scanners-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    @media (max-width: 1080px) {
+      .scanners-grid { grid-template-columns: 1fr; }
+    }
+    .scanner-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+      min-height: 340px;
+    }
+    .scanner-header {
+      padding: 12px 16px;
+      background: var(--head);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .scanner-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .scanner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .c-V1 { color: #34d399; } .d-V1 { background: #10b981; box-shadow: 0 0 8px #10b981; }
+    .c-HB { color: #60a5fa; } .d-HB { background: #3b82f6; box-shadow: 0 0 8px #3b82f6; }
+    .c-PA { color: #c084fc; } .d-PA { background: #a855f7; box-shadow: 0 0 8px #a855f7; }
+    .c-ICT { color: #fbbf24; } .d-ICT { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
+
+    .count-pill {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #0b1222;
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .table-scroll { overflow-x: auto; max-height: 295px; overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: 9px 8px;
+      border-bottom: 1px solid #1f2937;
+      text-align: center;
+      font-size: 12.5px;
+      white-space: nowrap;
+    }
+    th {
+      background: #0b1222;
+      color: #94a3b8;
+      font-size: 11px;
+      text-transform: uppercase;
+      position: sticky;
+      top: 0;
+    }
+    tbody tr:hover { background: rgba(59, 130, 246, 0.18); cursor: pointer; }
+    tr.flash td { background: rgba(16, 185, 129, 0.25); }
+    .pair { font-weight: 700; color: #f8fafc; }
+    .empty-box {
+      padding: 50px 15px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <div class="top-header-row">
+        <div class="brand">
+          <h1>FREEDOM WITH AHMII</h1>
+          <p>4 Parallel Live Scanners: V1 METHOD &bull; HIDEEN BULLISH &bull; PRICE ACTION &bull; ICT &bull; Auto-Hide: 20m</p>
+        </div>
+        <span class="owner-pill" id="ownerBadge">03254112787</span>
+      </div>
+      <div class="top-controls-row">
+        <div class="meta-strip">
+          <span>Scanned: <b id="stProgress">0/0</b></span>
+          <span>Total Signals: <b id="stCount">0</b></span>
+          <span>Cycle: <b id="stCycle">Scanning...</b></span>
+          <span>Status: <b id="stFeed">LIVE</b></span>
+        </div>
+        <div class="actions">
+          <button id="soundBtn" class="active-green" onclick="toggleSound()">Sound Alert: ON</button>
+          <button onclick="playBeep()">Test Sound</button>
+          <button id="notifBtn" onclick="enableNotif()">Desktop Pop-up</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="scanners-grid">
+      <div class="scanner-box">
+        <div class="scanner-header">
+          <div>
+            <div class="scanner-title c-V1"><span class="dot d-V1"></span> V1 METHOD</div>
+            <div class="scanner-sub">1D+1H Uptrend &bull; 1H RSI (52-58) &bull; 1H+30M SHA (10/10) Green &bull; 30M RSI &gt; 1H RSI</div>
+          </div>
+          <span class="count-pill" id="cnt-V1">0 Signals</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>1% Target</th><th>Setup</th><th>Entry</th></tr></thead>
+            <tbody id="body-V1"></tbody>
+          </table>
+          <div class="empty-box" id="empty-V1">Scanning Binance Spot USDT for V1 METHOD...</div>
+        </div>
+      </div>
+
+      <div class="scanner-box">
+        <div class="scanner-header">
+          <div>
+            <div class="scanner-title c-HB"><span class="dot d-HB"></span> HIDEEN BULLISH</div>
+            <div class="scanner-sub">1H Regular Bullish Divergence (RSI 25-40 Rising) &bull; 30M RSI &gt; 1H RSI &bull; Unbroken Line</div>
+          </div>
+          <span class="count-pill" id="cnt-HB">0 Signals</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>30M RSI</th><th>Prev RSI</th><th>Bars</th><th>Close</th></tr></thead>
+            <tbody id="body-HB"></tbody>
+          </table>
+          <div class="empty-box" id="empty-HB">Scanning Binance Spot USDT for HIDEEN BULLISH...</div>
+        </div>
+      </div>
+
+      <div class="scanner-box">
+        <div class="scanner-header">
+          <div>
+            <div class="scanner-title c-PA"><span class="dot d-PA"></span> PRICE ACTION</div>
+            <div class="scanner-sub">12H Liq + Strong 1H S/R (Gap 1.10%+) &bull; SW (25-40) / UP (30-40) &bull; 30M &gt; 1H RSI</div>
+          </div>
+          <span class="count-pill" id="cnt-PA">0 Signals</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Time</th><th>Pair</th><th>Trend (RSI)</th><th>1H Support</th><th>1H Resist</th><th>Gap %</th><th>Price</th></tr></thead>
+            <tbody id="body-PA"></tbody>
+          </table>
+          <div class="empty-box" id="empty-PA">Scanning Binance Spot USDT for PRICE ACTION...</div>
+        </div>
+      </div>
+
+      <div class="scanner-box">
+        <div class="scanner-header">
+          <div>
+            <div class="scanner-title c-ICT"><span class="dot d-ICT"></span> ICT</div>
+            <div class="scanner-sub">1H Sideways + 1%+ Green Pump Candles + Wick-Only Trendline Touch (RSI 30-40)</div>
+          </div>
+          <span class="count-pill" id="cnt-ICT">0 Signals</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Time</th><th>Pair</th><th>1H RSI</th><th>Candles</th><th>Pump %</th><th>Touch</th><th>Price</th></tr></thead>
+            <tbody id="body-ICT"></tbody>
+          </table>
+          <div class="empty-box" id="empty-ICT">Scanning Binance Spot USDT for ICT...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let soundEnabled = true;
+    let seenKeys = new Set();
+    let freshKeys = new Set();
+    let firstLoad = true;
+    let audioCtx = null;
+
+    function unlockAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    }
+    document.addEventListener("click", unlockAudio);
+
+    function playBeep() {
+      if (!soundEnabled) return;
+      try {
+        unlockAudio();
+        const now = audioCtx.currentTime;
+        [950, 1250, 1550].forEach((freq, idx) => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(freq, now + idx * 0.16);
+          gain.gain.setValueAtTime(0.2, now + idx * 0.16);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.16 + 0.15);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now + idx * 0.16);
+          osc.stop(now + idx * 0.16 + 0.16);
+        });
+      } catch (e) {}
+    }
+
+    function toggleSound() {
+      unlockAudio();
+      soundEnabled = !soundEnabled;
+      const btn = document.getElementById("soundBtn");
+      btn.textContent = soundEnabled ? "Sound Alert: ON" : "Sound Alert: OFF";
+      btn.className = soundEnabled ? "active-green" : "";
+      if (soundEnabled) playBeep();
+    }
+
+    async function enableNotif() {
+      if (!("Notification" in window)) return;
+      if (Notification.permission !== "granted") await Notification.requestPermission();
+      const btn = document.getElementById("notifBtn");
+      if (Notification.permission === "granted") {
+        btn.textContent = "Desktop Pop-up: ON";
+        btn.className = "active-blue";
+      }
+    }
+
+    function showDesktopAlert(s) {
+      const names = { V1: "V1 METHOD", HB: "HIDEEN BULLISH", PA: "PRICE ACTION", ICT: "ICT" };
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification(`FREEDOM WITH AHMII [${names[s.scanner] || s.scanner}]`, {
+          body: `${s.symbol} | ${s.col1} | Price: ${s.price}`
+        });
+      }
+    }
+
+    function renderBox(code, list) {
+      const tbody = document.getElementById(`body-${code}`);
+      const empty = document.getElementById(`empty-${code}`);
+      const cnt = document.getElementById(`cnt-${code}`);
+
+      cnt.textContent = `${list.length} Signal${list.length === 1 ? "" : "s"}`;
+      tbody.innerHTML = "";
+
+      if (list.length === 0) {
+        empty.style.display = "block";
+        return;
+      }
+      empty.style.display = "none";
+
+      for (const s of list) {
+        const key = `${s.scanner}|${s.symbol}|${s.detected_at}`;
+        const tr = document.createElement("tr");
+        if (freshKeys.has(key)) tr.className = "flash";
+        tr.onclick = () => window.open(
+          `https://www.tradingview.com/chart/?symbol=BINANCE:${s.symbol}&interval=${s.timeframe || 60}`,
+          "_blank"
+        );
+        const shortTime = (s.detected_at || "").split(" ")[1] || s.detected_at;
+        tr.innerHTML = `
+          <td>${shortTime}</td>
+          <td class="pair">${s.symbol}</td>
+          <td>${s.col1}</td>
+          <td>${s.col2}</td>
+          <td>${s.col3}</td>
+          <td>${s.col4}</td>
+          <td>${s.price}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch("/api/signals");
+        const data = await res.json();
+        const st = data.status || {};
+        const all = data.signals || [];
+
+        if (st.owner) {
+          document.getElementById("ownerBadge").textContent = st.owner;
+        }
+        document.getElementById("stProgress").textContent = `${st.scanned || 0}/${st.total || 0}`;
+        document.getElementById("stCount").textContent = all.length;
+        document.getElementById("stCycle").textContent = st.last_cycle || "Scanning...";
+        document.getElementById("stFeed").textContent = st.running ? "LIVE" : "IDLE";
+
+        let incoming = [];
+        for (const s of all) {
+          const key = `${s.scanner}|${s.symbol}|${s.detected_at}`;
+          if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            if (!firstLoad) incoming.push(s);
+          }
+        }
+
+        if (incoming.length > 0) {
+          freshKeys = new Set(incoming.map(x => `${x.scanner}|${x.symbol}|${x.detected_at}`));
+          playBeep();
+          showDesktopAlert(incoming[0]);
+        }
+
+        ["V1", "HB", "PA", "ICT"].forEach(code => {
+          renderBox(code, all.filter(x => x.scanner === code));
+        });
+
+        firstLoad = false;
+      } catch (e) {
+        document.getElementById("stFeed").textContent = "OFFLINE";
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML_PAGE
