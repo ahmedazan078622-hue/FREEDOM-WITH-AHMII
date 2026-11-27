@@ -551,19 +551,22 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .status-line b { color: #38bdf8; }
     .main-layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 280px;
+      display: flex;
+      flex-direction: row;
       gap: 16px;
-      align-items: start;
+      align-items: flex-start;
+      width: 100%;
     }
     .stack-list {
+      flex: 1 1 auto;
       min-width: 0;
       display: flex;
       flex-direction: column;
       gap: 16px;
     }
     .side-panel {
-      width: 280px;
+      flex: 0 0 270px;
+      width: 270px;
       position: sticky;
       top: 16px;
     }
@@ -709,8 +712,8 @@ HTML_PAGE = """<!DOCTYPE html>
       font-size: 12px;
     }
     @media (max-width: 960px) {
-      .main-layout { grid-template-columns: minmax(0, 1fr); }
-      .side-panel { width: 100%; position: static; }
+      .main-layout { flex-direction: column; }
+      .side-panel { flex: 1 1 auto; width: 100%; position: static; }
     }
   </style>
 </head>
