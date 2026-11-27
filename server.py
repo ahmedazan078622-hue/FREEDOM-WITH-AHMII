@@ -532,7 +532,7 @@ HTML_PAGE = """<!DOCTYPE html>
       padding: 18px 16px 44px;
     }
     .wrap {
-      max-width: 1520px;
+      max-width: 1560px;
       margin: 0 auto;
     }
     .top-bar {
@@ -551,12 +551,12 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .status-line b { color: #38bdf8; }
     .main-layout {
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
       gap: 16px;
-      align-items: flex-start;
+      align-items: start;
     }
     .stack-list {
-      flex: 1;
       min-width: 0;
       display: flex;
       flex-direction: column;
@@ -564,7 +564,6 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .side-panel {
       width: 280px;
-      flex-shrink: 0;
       position: sticky;
       top: 16px;
     }
@@ -709,8 +708,8 @@ HTML_PAGE = """<!DOCTYPE html>
       color: #475569;
       font-size: 12px;
     }
-    @media (max-width: 900px) {
-      .main-layout { flex-direction: column; }
+    @media (max-width: 960px) {
+      .main-layout { grid-template-columns: minmax(0, 1fr); }
       .side-panel { width: 100%; position: static; }
     }
   </style>
