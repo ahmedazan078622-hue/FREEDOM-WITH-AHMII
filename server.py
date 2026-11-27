@@ -17,6 +17,8 @@ BINANCE_ENDPOINTS = [
 ]
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 
+OWNER_LABEL = "AHMII OWNER | 03254112787"
+SIGNAL_TTL_SECONDS = 20 * 60  # 20 minutes
 ALERT_COOLDOWN_SECONDS = 900
 SYMBOL_REFRESH_SECONDS = 900
 
@@ -42,9 +44,18 @@ SCAN_STATUS: Dict[str, Any] = {
     "scanned": 0,
     "total": 0,
     "working_url": BINANCE_ENDPOINTS[0],
+    "owner": OWNER_LABEL,
 }
 _lock = threading.Lock()
 _stop_event = threading.Event()
+
+
+def prune_expired_signals_locked(now_ts: float):
+    global LATEST_SIGNALS
+    LATEST_SIGNALS = [
+        s for s in LATEST_SIGNALS
+        if (now_ts - float(s.get("created_ts", now_ts))) <= SIGNAL_TTL_SECONDS
+    ]
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -593,13 +604,12 @@ def check_ict(df_1h: pd.DataFrame):
     }
 
 
-def _scan_symbol(symbol: str, base_url: str) -> List[Dict[str, Any]]:
+def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -> List[Dict[str, Any]]:
     if _stop_event.is_set():
         return []
-    s = requests.Session()
     found: List[Dict[str, Any]] = []
     try:
-        df_1h = fetch_klines_df(s, symbol, base_url, "1h", 250)
+        df_1h = fetch_klines_df(shared_session, symbol, base_url, "1h", 250)
         if df_1h.empty or len(df_1h) < 50:
             return []
 
@@ -607,50 +617,47 @@ def _scan_symbol(symbol: str, base_url: str) -> List[Dict[str, Any]]:
         if np.isnan(rsi_1h_val):
             return []
 
-        # ICT needs only 1H (RSI 30-40)
         if 30.0 <= rsi_1h_val <= 40.0:
             sig_ict = check_ict(df_1h)
             if sig_ict:
                 found.append(sig_ict)
 
-        # Fetch 30m when RSI is in 25-40 (for HB & PA) OR 52-58 (for V1)
         need_30m = (25.0 <= rsi_1h_val <= 40.0) or (52.0 <= rsi_1h_val <= 58.0)
-        df_30m = fetch_klines_df(s, symbol, base_url, "30m", 150) if need_30m else pd.DataFrame()
+        df_30m = fetch_klines_df(shared_session, symbol, base_url, "30m", 150) if need_30m else pd.DataFrame()
 
-        # V1 METHOD (1H RSI 52-58)
         if 52.0 <= rsi_1h_val <= 58.0 and len(df_1h) >= 210 and not df_30m.empty:
             if _trend_is_up_ema(df_1h) and _has_fast_movement(df_1h, 0.4) and _sha_green(df_1h):
-                df_1d = fetch_klines_df(s, symbol, base_url, "1d", 250)
+                df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
                 sig_v1 = check_v1_method(df_1h, df_30m, df_1d)
                 if sig_v1:
                     found.append(sig_v1)
 
-        # HIDEEN BULLISH & PRICE ACTION (1H RSI 25-40)
         if 25.0 <= rsi_1h_val <= 40.0 and not df_30m.empty:
             sig_hb = check_hideen_bullish(df_1h, df_30m)
             if sig_hb:
                 found.append(sig_hb)
 
-            trend_pa = _detect_1h_trend_pa(df_1h)
-            if trend_pa in ("UP", "SIDEWAYS"):
-                df_12h = fetch_klines_df(s, symbol, base_url, "12h", 60)
-                sig_pa = check_price_action(df_1h, df_30m, df_12h, s, symbol)
-                if sig_pa:
-                    found.append(sig_pa)
+        trend_pa = _detect_1h_trend_pa(df_1h)
+        if trend_pa in ("UP", "SIDEWAYS"):
+            df_12h = fetch_klines_df(shared_session, symbol, base_url, "12h", 60)
+            sig_pa = check_price_action(df_1h, df_30m, df_12h, shared_session, symbol)
+            if sig_pa:
+                found.append(sig_pa)
 
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_ts = now_dt.timestamp()
         for item in found:
             item["symbol"] = symbol
             item["detected_at"] = now_str
+            item["created_ts"] = now_ts
         return found
     except Exception:
         return []
-    finally:
-        s.close()
 
 
 def _bg_loop():
-    s = requests.Session()
+    session = requests.Session()
     cached_symbols: List[str] = []
     last_sym_fetch = 0.0
     working_url = BINANCE_ENDPOINTS[0]
@@ -659,47 +666,50 @@ def _bg_loop():
         try:
             now = time.time()
             if not cached_symbols or (now - last_sym_fetch) >= SYMBOL_REFRESH_SECONDS:
-                cached_symbols, working_url = get_spot_usdt_symbols(s)
+                cached_symbols, working_url = get_spot_usdt_symbols(session)
                 last_sym_fetch = time.time()
 
             with _lock:
+                prune_expired_signals_locked(time.time())
                 SCAN_STATUS["running"] = True
                 SCAN_STATUS["scanned"] = 0
                 SCAN_STATUS["total"] = len(cached_symbols)
                 SCAN_STATUS["working_url"] = working_url
+                SCAN_STATUS["owner"] = OWNER_LABEL
 
-            new_hits: List[Dict[str, Any]] = []
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = [pool.submit(_scan_symbol, sym, working_url) for sym in cached_symbols]
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = [pool.submit(_scan_symbol, sym, working_url, session) for sym in cached_symbols]
                 for fut in as_completed(futures):
                     if _stop_event.is_set():
                         break
                     res_list = fut.result()
-                    if res_list:
-                        new_hits.extend(res_list)
+                    now_ts = time.time()
                     with _lock:
+                        prune_expired_signals_locked(now_ts)
+                        for item in res_list:
+                            cd_key = f"{item['scanner']}:{item['symbol']}"
+                            if (now_ts - ALERT_HISTORY.get(cd_key, 0.0)) >= ALERT_COOLDOWN_SECONDS:
+                                ALERT_HISTORY[cd_key] = now_ts
+                                LATEST_SIGNALS.insert(0, item)
+                                del LATEST_SIGNALS[400:]
                         SCAN_STATUS["scanned"] += 1
 
             with _lock:
-                now_ts = time.time()
-                for item in new_hits:
-                    cd_key = f"{item['scanner']}:{item['symbol']}"
-                    if (now_ts - ALERT_HISTORY.get(cd_key, 0.0)) >= ALERT_COOLDOWN_SECONDS:
-                        ALERT_HISTORY[cd_key] = now_ts
-                        LATEST_SIGNALS.insert(0, item)
-                del LATEST_SIGNALS[400:]
+                prune_expired_signals_locked(time.time())
                 SCAN_STATUS["last_cycle"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         except Exception:
             pass
 
-        for _ in range(15):
+        for _ in range(10):
             if _stop_event.is_set():
                 break
+            with _lock:
+                prune_expired_signals_locked(time.time())
             time.sleep(1)
 
     with _lock:
         SCAN_STATUS["running"] = False
-    s.close()
+    session.close()
 
 
 @app.on_event("startup")
@@ -715,7 +725,9 @@ def on_shutdown():
 
 @app.get("/api/signals")
 def get_signals():
+    now_ts = time.time()
     with _lock:
+        prune_expired_signals_locked(now_ts)
         return {
             "status": dict(SCAN_STATUS),
             "signals": list(LATEST_SIGNALS),
@@ -768,6 +780,16 @@ HTML_PAGE = """<!DOCTYPE html>
       -webkit-text-fill-color: transparent;
     }
     .brand p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+    .owner-pill {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #1d4ed8;
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 700;
+    }
     .meta-strip {
       display: flex;
       gap: 16px;
@@ -873,7 +895,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="topbar">
       <div class="brand">
         <h1>FREEDOM WITH AHMII</h1>
-        <p>4 Parallel Live Scanners: V1 METHOD &bull; HIDEEN BULLISH &bull; PRICE ACTION &bull; ICT</p>
+        <p>4 Parallel Live Scanners: V1 METHOD &bull; HIDEEN BULLISH &bull; PRICE ACTION &bull; ICT &bull; Auto-Hide: 20m</p>
+        <span class="owner-pill" id="ownerBadge">AHMII OWNER | 03254112787</span>
       </div>
       <div class="meta-strip">
         <span>Scanned: <b id="stProgress">0/0</b></span>
@@ -889,7 +912,6 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="scanners-grid">
-      <!-- 1. V1 METHOD -->
       <div class="scanner-box">
         <div class="scanner-header">
           <div>
@@ -907,7 +929,6 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 2. HIDEEN BULLISH -->
       <div class="scanner-box">
         <div class="scanner-header">
           <div>
@@ -925,7 +946,6 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 3. PRICE ACTION -->
       <div class="scanner-box">
         <div class="scanner-header">
           <div>
@@ -943,7 +963,6 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 4. ICT -->
       <div class="scanner-box">
         <div class="scanner-header">
           <div>
@@ -1067,6 +1086,9 @@ HTML_PAGE = """<!DOCTYPE html>
         const st = data.status || {};
         const all = data.signals || [];
 
+        if (st.owner) {
+          document.getElementById("ownerBadge").textContent = st.owner;
+        }
         document.getElementById("stProgress").textContent = `${st.scanned || 0}/${st.total || 0}`;
         document.getElementById("stCount").textContent = all.length;
         document.getElementById("stCycle").textContent = st.last_cycle || "Scanning...";
@@ -1098,10 +1120,11 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     refresh();
-    setInterval(refresh, 5000);
+    setInterval(refresh, 2000);
   </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
