@@ -1,37 +1,984 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import requests
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-app = FastAPI()
+BINANCE_ENDPOINTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+]
+BINANCE_FUTURES_URL = "https://fapi.binance.com"
+OWNER_LABEL = "03254112787"
+PKT_TZ = timezone(timedelta(hours=5))
+
+SIGNAL_TTL_SECONDS = 60 * 60
+ALERT_COOLDOWN_SECONDS = 900
+SYMBOL_REFRESH_SECONDS = 900
+SCANNERS_ORDER = ["V1", "PA", "HB", "ICT", "OC"]
+
+EXCLUDED_BASES = {
+    "USDT", "USDC", "USDS", "BUSD", "FDUSD", "TUSD", "USDP", "DAI",
+    "UST", "USTC", "USDE", "USD1", "PYUSD", "USDD", "EUR", "TRY",
+    "BRL", "GBP", "AUD", "BIDR", "PAXG",
+}
+
+app = FastAPI(title="FREEDOM WITH AHMII")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+LATEST_SIGNALS: List[Dict[str, Any]] = []
+ALERT_HISTORY: Dict[str, float] = {}
+SCAN_STATUS: Dict[str, Any] = {
+    "running": False,
+    "last_cycle": None,
+    "scanned": 0,
+    "total": 0,
+    "working_url": BINANCE_ENDPOINTS[0],
+    "owner": OWNER_LABEL,
+}
+
+_lock = threading.Lock()
+_stop_event = threading.Event()
+
+
+def format_pkt_time(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(PKT_TZ).strftime("%H:%M:%S PKT")
+
+
+def prune_expired_signals_locked(now_ts: float) -> None:
+    global LATEST_SIGNALS
+    LATEST_SIGNALS = [
+        s for s in LATEST_SIGNALS
+        if (now_ts - float(s.get("created_ts", now_ts))) <= SIGNAL_TTL_SECONDS
+    ]
+
+
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss != 0.0, 100.0)
+    rsi = rsi.where(~((avg_gain == 0.0) & (avg_loss == 0.0)), 50.0)
+    return rsi
+
+
+def ema_list(values: List[float], length: int) -> List[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (length + 1.0)
+    out = [float(values[0])]
+    for v in values[1:]:
+        out.append(float(v) * alpha + out[-1] * (1.0 - alpha))
+    return out
+
+
+def fetch_json_with_fallback(
+    session: requests.Session,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    preferred_url: Optional[str] = None,
+    timeout: int = 12,
+):
+    urls = list(BINANCE_ENDPOINTS)
+    if preferred_url and preferred_url in urls:
+        urls.remove(preferred_url)
+        urls.insert(0, preferred_url)
+    last_error = None
+    for base_url in urls:
+        try:
+            resp = session.get(f"{base_url}{path}", params=params, timeout=timeout)
+            if resp.status_code == 429:
+                raise RuntimeError("RATE_LIMIT_429")
+            if resp.status_code == 418:
+                last_error = RuntimeError("418_BLOCK")
+                continue
+            resp.raise_for_status()
+            return resp.json(), base_url
+        except RuntimeError as r_err:
+            if str(r_err) == "RATE_LIMIT_429":
+                raise last_error = r_err
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(str(last_error or "All endpoints failed"))
+
+
+def get_spot_usdt_symbols(session: requests.Session):
+    info_data, working_url = fetch_json_with_fallback(session, "/api/v3/exchangeInfo", timeout=15)
+    valid_spot = set()
+    for s in info_data.get("symbols", []):
+        base = s.get("baseAsset", "")
+        sym = s.get("symbol", "")
+        if (
+            s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+            and s.get("isSpotTradingAllowed", True)
+            and base not in EXCLUDED_BASES
+            and not any(base.endswith(x) for x in ("UP", "DOWN", "BULL", "BEAR"))
+        ):
+            valid_spot.add(sym)
+    try:
+        tickers, working_url = fetch_json_with_fallback(
+            session, "/api/v3/ticker/24hr", preferred_url=working_url, timeout=15
+        )
+        vol_map = {}
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if sym in valid_spot:
+                try:
+                    vol_map[sym] = float(t.get("quoteVolume", 0.0))
+                except ValueError:
+                    vol_map[sym] = 0.0
+        return sorted(valid_spot, key=lambda x: vol_map.get(x, 0.0), reverse=True), working_url
+    except Exception:
+        return sorted(valid_spot), working_url
+
+
+def fetch_klines_df(
+    session: requests.Session, symbol: str, base_url: str, interval: str, limit: int
+) -> pd.DataFrame:
+    raw, _ = fetch_json_with_fallback(
+        session,
+        "/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        preferred_url=base_url,
+        timeout=12,
+    )
+    if not raw:
+        return pd.DataFrame()
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(raw, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df.set_index("open_time", inplace=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+def _trend_is_up_ema(df: pd.DataFrame) -> bool:
+    if df.empty or len(df) < 208:
+        return False
+    closes = df["close"].iloc[:-1].tolist()
+    e50 = ema_list(closes, 50)[-1]
+    e200 = ema_list(closes, 200)[-1]
+    return closes[-1] > e50 and closes[-1] > e200
+
+
+def _has_fast_movement(df_1h: pd.DataFrame, min_move_pct: float = 0.4) -> bool:
+    if len(df_1h) < 16:
+        return False
+    sub = df_1h.iloc[-13:-1]
+    moves = []
+    for _, row in sub.iterrows():
+        if row["low"] > 0:
+            moves.append(((row["high"] - row["low"]) / row["low"]) * 100.0)
+    return bool(moves) and (sum(moves) / len(moves)) >= min_move_pct
+
+
+def _sha_green(df: pd.DataFrame, smooth_len: int = 10, after_len: int = 10) -> bool:
+    if df.empty or len(df) < 40:
+        return False
+    opens = df["open"].tolist()
+    highs = df["high"].tolist()
+    lows = df["low"].tolist()
+    closes = df["close"].tolist()
+    so = ema_list(opens, smooth_len)
+    sh = ema_list(highs, smooth_len)
+    sl = ema_list(lows, smooth_len)
+    sc = ema_list(closes, smooth_len)
+    ha_close = [(so[i] + sh[i] + sl[i] + sc[i]) / 4.0 for i in range(len(df))]
+    ha_open = [0.0] * len(df)
+    ha_open[0] = (so[0] + sc[0]) / 2.0
+    for i in range(1, len(df)):
+        ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2.0
+    final_open = ema_list(ha_open, after_len)
+    final_close = ema_list(ha_close, after_len)
+    return final_close[-1] > final_open[-1]
+
+
+def check_v1_method(df_1h: pd.DataFrame, df_30m: pd.DataFrame, df_1d: pd.DataFrame):
+    if not _trend_is_up_ema(df_1h):
+        return None
+    if not _has_fast_movement(df_1h, 0.4):
+        return None
+    if not _sha_green(df_1h):
+        return None
+    rsi_1h_s = calculate_rsi(df_1h["close"], 14)
+    rsi_1h = float(rsi_1h_s.iloc[-1])
+    prev_rsi_1h = float(rsi_1h_s.iloc[-2])
+    if np.isnan(rsi_1h) or np.isnan(prev_rsi_1h):
+        return None
+    if not (rsi_1h > prev_rsi_1h and 52.0 <= rsi_1h <= 58.0):
+        return None
+    if not _trend_is_up_ema(df_1d):
+        return None
+    if not _sha_green(df_30m):
+        return None
+    rsi_30m_s = calculate_rsi(df_30m["close"], 14)
+    rsi_30m = float(rsi_30m_s.iloc[-1])
+    prev_rsi_30m = float(rsi_30m_s.iloc[-2])
+    if np.isnan(rsi_30m) or np.isnan(prev_rsi_30m):
+        return None
+    if not (rsi_30m > rsi_1h and rsi_30m >= prev_rsi_30m and rsi_30m <= 80.0):
+        return None
+    price = float(df_1h["close"].iloc[-1])
+    target = price * 1.01
+    return {
+        "scanner": "V1",
+        "timeframe": "30",
+        "metric": f"RSI {rsi_1h:.1f} / {rsi_30m:.1f}",
+        "detail": f"Tgt {target:.6f}".rstrip("0").rstrip("."),
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def check_hideen_bullish(df_1h: pd.DataFrame, df_30m: pd.DataFrame):
+    if df_1h.empty or df_30m.empty or len(df_1h) < 130 or len(df_30m) < 30:
+        return None
+    rsi_1h = calculate_rsi(df_1h["close"], 14)
+    rsi_30m = calculate_rsi(df_30m["close"], 14)
+    live_1h_rsi = float(rsi_1h.iloc[-1])
+    prev_1h_rsi = float(rsi_1h.iloc[-2])
+    live_30m_rsi = float(rsi_30m.iloc[-1])
+    if np.isnan(live_1h_rsi) or np.isnan(prev_1h_rsi) or np.isnan(live_30m_rsi):
+        return None
+    if not (25.0 <= live_1h_rsi <= 40.0):
+        return None
+    if not (live_30m_rsi > live_1h_rsi and live_1h_rsi > prev_1h_rsi):
+        return None
+    lows = df_1h["low"].to_numpy(dtype=float)
+    highs = df_1h["high"].to_numpy(dtype=float)
+    closes = df_1h["close"].to_numpy(dtype=float)
+    rsis = rsi_1h.to_numpy(dtype=float)
+    n = len(df_1h)
+    live_idx = n - 1
+    curr_low = min(float(lows[-1]), float(lows[-2]))
+    for prev_pos in range(live_idx - 4, max(1, live_idx - 101), -1):
+        if np.isnan(rsis[prev_pos]):
+            continue
+        if not (
+            lows[prev_pos] <= min(lows[prev_pos - 2 : prev_pos])
+            and lows[prev_pos] <= min(lows[prev_pos + 1 : prev_pos + 3])
+        ):
+            continue
+        bar_diff = live_idx - prev_pos
+        prev_low = float(lows[prev_pos])
+        prev_rsi = float(rsis[prev_pos])
+        if not (18.0 <= prev_rsi <= 48.0):
+            continue
+        mid_high = float(np.max(highs[prev_pos + 1 : live_idx]))
+        if mid_high <= max(prev_low, curr_low) * 1.003:
+            continue
+        if not (curr_low < prev_low and (live_1h_rsi - prev_rsi) >= 1.0):
+            continue
+        rsi_slope = (live_1h_rsi - prev_rsi) / bar_diff
+        broken = any(
+            rsis[prev_pos + j] < (prev_rsi + rsi_slope * j - 0.25)
+            for j in range(1, bar_diff)
+        )
+        if broken:
+            continue
+        price = float(closes[-1])
+        return {
+            "scanner": "HB",
+            "timeframe": "60",
+            "metric": f"RSI {live_1h_rsi:.1f} / {live_30m_rsi:.1f}",
+            "detail": f"{bar_diff} bars",
+            "price": f"{price:.8f}".rstrip("0").rstrip("."),
+        }
+    return None
+
+
+def _detect_1h_trend_pa(df_1h: pd.DataFrame, lookback: int = 36):
+    if len(df_1h) < lookback + 5:
+        return None
+    sub = df_1h.iloc[-(lookback + 1) : -1]
+    start_p = float(sub["close"].iloc[0])
+    end_p = float(sub["close"].iloc[-1])
+    min_l = float(sub["low"].min())
+    max_h = float(sub["high"].max())
+    if start_p <= 0 or min_l <= 0:
+        return None
+    net_pct = ((end_p - start_p) / start_p) * 100.0
+    range_pct = ((max_h - min_l) / min_l) * 100.0
+    ema_fast = sub["close"].ewm(span=12, adjust=False).mean().iloc[-1]
+    ema_slow = sub["close"].ewm(span=26, adjust=False).mean().iloc[-1]
+    if net_pct >= 2.0 and ema_fast >= ema_slow:
+        return "UP"
+    if abs(net_pct) <= 8.0 and range_pct <= 18.0:
+        return "SIDEWAYS"
+    return None
+
+
+def _count_1h_reactions(prices_arr, level, tol=0.006):
+    if level is None or level <= 0 or len(prices_arr) == 0:
+        return 0
+    return int(np.sum(np.abs(prices_arr - level) / max(level, 1e-12) <= tol))
+
+
+def check_price_action(
+    df_1h: pd.DataFrame,
+    df_30m: pd.DataFrame,
+    df_12h: pd.DataFrame,
+    session: requests.Session,
+    symbol: str,
+):
+    if (
+        df_1h.empty or df_30m.empty or df_12h.empty
+        or len(df_1h) < 50 or len(df_30m) < 30 or len(df_12h) < 15
+    ):
+        return None
+    trend_1h = _detect_1h_trend_pa(df_1h)
+    if trend_1h not in ("UP", "SIDEWAYS"):
+        return None
+    rsi_1h_now = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    rsi_30m_now = float(calculate_rsi(df_30m["close"], 14).iloc[-1])
+    if np.isnan(rsi_1h_now) or np.isnan(rsi_30m_now):
+        return None
+    if trend_1h == "SIDEWAYS" and not (25.0 <= rsi_1h_now <= 40.0):
+        return None
+    if trend_1h == "UP" and not (30.0 <= rsi_1h_now <= 40.0):
+        return None
+    if not (rsi_30m_now > rsi_1h_now):
+        return None
+
+    curr_close = float(df_1h["close"].iloc[-1])
+    curr_low = float(df_1h["low"].iloc[-1])
+    highs = df_12h["high"].to_numpy(dtype=float)
+    lows = df_12h["low"].to_numpy(dtype=float)
+    closes = df_12h["close"].to_numpy(dtype=float)
+    vols = df_12h["volume"].to_numpy(dtype=float)
+    n = len(df_12h)
+    avg_vol = float(np.mean(vols)) if n > 0 else 1.0
+
+    liq_low_scores = {}
+    liq_high_scores = {}
+    for i in range(2, n - 1):
+        vw = max(1.0, vols[i] / max(avg_vol, 1e-9))
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+            lvl = float(lows[i])
+            liq_low_scores[lvl] = liq_low_scores.get(lvl, 0.0) + vw
+        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
+            lvl = float(highs[i])
+            liq_high_scores[lvl] = liq_high_scores.get(lvl, 0.0) + vw
+
+    for lvl in list(liq_low_scores.keys()):
+        c = sum(1 for o in liq_low_scores if abs(o - lvl) / max(lvl, 1e-12) <= 0.007)
+        if c >= 2:
+            liq_low_scores[lvl] *= (1.0 + 0.65 * c)
+    for lvl in list(liq_high_scores.keys()):
+        c = sum(1 for o in liq_high_scores if abs(o - lvl) / max(lvl, 1e-12) <= 0.007)
+        if c >= 2:
+            liq_high_scores[lvl] *= (1.0 + 0.65 * c)
+
+    try:
+        oi_resp = session.get(
+            f"{BINANCE_FUTURES_URL}/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=4,
+        )
+        if oi_resp.status_code == 200 and float(oi_resp.json().get("openInterest", 0.0)) > 0:
+            for ap in closes[-4:]:
+                for pct in (0.035, 0.060, 0.090):
+                    ll = round(float(ap * (1.0 - pct)), 8)
+                    sl = round(float(ap * (1.0 + pct)), 8)
+                    liq_low_scores[ll] = liq_low_scores.get(ll, 0.0) + 1.25
+                    liq_high_scores[sl] = liq_high_scores.get(sl, 0.0) + 1.25
+    except Exception:
+        pass
+
+    valid_lows = {k: v for k, v in liq_low_scores.items() if k <= curr_close * 1.006}
+    valid_highs = {k: v for k, v in liq_high_scores.items() if k > curr_close}
+    h1_lows = df_1h["low"].iloc[:-1].to_numpy(dtype=float)
+    h1_highs = df_1h["high"].iloc[:-1].to_numpy(dtype=float)
+
+    cand_sup = []
+    for z, zs in valid_lows.items():
+        nb = h1_lows[np.abs(h1_lows - z) / max(z, 1e-12) <= 0.010]
+        lvl = float(np.min(nb)) if len(nb) > 0 else float(z)
+        touches = _count_1h_reactions(h1_lows, lvl) + len(nb)
+        st = float(zs) + 0.6 * touches
+        if lvl <= curr_close * 1.006 and (st >= 2.0 or touches >= 2):
+            cand_sup.append((lvl, st))
+    for i in range(2, len(h1_lows) - 1):
+        if h1_lows[i] <= h1_lows[i - 1] and h1_lows[i] <= h1_lows[i + 1]:
+            sl = float(h1_lows[i])
+            touches = _count_1h_reactions(h1_lows, sl)
+            near_12 = any(abs(sl - z) / max(z, 1e-12) <= 0.015 for z in valid_lows)
+            st = 0.7 * touches + (1.5 if near_12 else 0.0)
+            if sl <= curr_close * 1.006 and touches >= 2 and st >= 2.0:
+                cand_sup.append((sl, st))
+    if not cand_sup:
+        return None
+    best_sup, _ = max(
+        cand_sup,
+        key=lambda it: (round(it[1], 2), -abs(curr_close - it[0]) / max(curr_close, 1e-12)),
+    )
+    min_req_res = best_sup * 1.011
+
+    cand_res = []
+    for z, zs in valid_highs.items():
+        nb = h1_highs[np.abs(h1_highs - z) / max(z, 1e-12) <= 0.010]
+        lvl = float(np.max(nb)) if len(nb) > 0 else float(z)
+        touches = _count_1h_reactions(h1_highs, lvl) + len(nb)
+        st = float(zs) + 0.6 * touches
+        if lvl >= min_req_res and lvl > curr_close and (st >= 2.0 or touches >= 2):
+            cand_res.append((lvl, st))
+    for i in range(2, len(h1_highs) - 1):
+        if h1_highs[i] >= h1_highs[i - 1] and h1_highs[i] >= h1_highs[i + 1]:
+            sh = float(h1_highs[i])
+            touches = _count_1h_reactions(h1_highs, sh)
+            near_12 = any(abs(sh - z) / max(z, 1e-12) <= 0.015 for z in valid_highs)
+            st = 0.7 * touches + (1.5 if near_12 else 0.0)
+            if sh >= min_req_res and sh > curr_close and touches >= 2 and st >= 2.0:
+                cand_res.append((sh, st))
+    if not cand_res:
+        return None
+    best_res, _ = max(cand_res, key=lambda it: (round(it[1], 2), -it[0]))
+    gap_pct = ((best_res - best_sup) / best_sup) * 100.0
+    if gap_pct < 1.10:
+        return None
+    upper_zone = best_sup * 1.004
+    lower_zone = best_sup * 0.996
+    if not (curr_low <= upper_zone and curr_close >= lower_zone):
+        return None
+    return {
+        "scanner": "PA",
+        "timeframe": "60",
+        "metric": f"{trend_1h} ({rsi_1h_now:.0f})",
+        "detail": f"Gap {gap_pct:.1f}%",
+        "price": f"{curr_close:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def _is_sideways_ict(df: pd.DataFrame, anchor_idx: int) -> bool:
+    end_idx = max(1, anchor_idx)
+    start_idx = max(0, end_idx - 24)
+    if (end_idx - start_idx) < 10:
+        return False
+    sub = df.iloc[start_idx:end_idx]
+    min_low = float(sub["low"].min())
+    max_high = float(sub["high"].max())
+    if min_low <= 0:
+        return False
+    range_pct = ((max_high - min_low) / min_low) * 100.0
+    start_p = float(sub["open"].iloc[0])
+    end_p = float(sub["close"].iloc[-1])
+    net_pct = abs((end_p - start_p) / max(start_p, 1e-12)) * 100.0
+    return (range_pct <= 15.0) and (net_pct <= 7.0)
+
+
+def check_ict(df_1h: pd.DataFrame):
+    if df_1h.empty or len(df_1h) < 50:
+        return None
+    live_rsi = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+    if np.isnan(live_rsi) or not (30.0 <= live_rsi <= 40.0):
+        return None
+    opens = df_1h["open"].to_numpy(dtype=float)
+    highs = df_1h["high"].to_numpy(dtype=float)
+    lows = df_1h["low"].to_numpy(dtype=float)
+    closes = df_1h["close"].to_numpy(dtype=float)
+    curr_idx = len(df_1h) - 1
+    if not (closes[curr_idx] < opens[curr_idx]):
+        return None
+    prev_idx = curr_idx - 1
+    if not (closes[prev_idx] > opens[prev_idx]):
+        return None
+    prev_pump = ((closes[prev_idx] - opens[prev_idx]) / max(opens[prev_idx], 1e-12)) * 100.0
+    if prev_pump < 1.0:
+        return None
+    green_pumps = [round(prev_pump, 2)]
+    pullbacks_used = 0
+    anchor_idx = None
+    earliest = max(2, curr_idx - 25)
+    idx = prev_idx - 1
+    while idx >= earliest:
+        if closes[idx] > opens[idx]:
+            p_pct = ((closes[idx] - opens[idx]) / max(opens[idx], 1e-12)) * 100.0
+            if p_pct < 1.0:
+                return None
+            green_pumps.append(round(p_pct, 2))
+            idx -= 1
+        elif closes[idx] < opens[idx]:
+            drop_pct = ((opens[idx] - closes[idx]) / max(opens[idx], 1e-12)) * 100.0
+            pb_before = idx - 1
+            has_earlier_green = (
+                pb_before >= earliest
+                and closes[pb_before] > opens[pb_before]
+                and ((closes[pb_before] - opens[pb_before]) / max(opens[pb_before], 1e-12)) * 100.0 >= 1.0
+            )
+            if pullbacks_used < 1 and drop_pct <= 0.8 and has_earlier_green:
+                pullbacks_used += 1
+                idx -= 1
+                continue
+            anchor_idx = idx
+            break
+        else:
+            return None
+    if anchor_idx is None or (curr_idx - anchor_idx) < 2:
+        return None
+    if not _is_sideways_ict(df_1h, anchor_idx):
+        return None
+    p1 = float(closes[anchor_idx])
+    p2 = float(closes[curr_idx])
+    span = curr_idx - anchor_idx
+    wick_touches = 0
+    for k in range(1, span):
+        mid = anchor_idx + k
+        line_val = p1 + (p2 - p1) * (k / span)
+        tol = line_val * 0.0015
+        body_low = min(opens[mid], closes[mid])
+        body_high = max(opens[mid], closes[mid])
+        if (body_low - tol) <= line_val <= (body_high + tol):
+            return None
+        if (lows[mid] - tol) <= line_val <= (highs[mid] + tol):
+            wick_touches += 1
+    if wick_touches < 1:
+        return None
+    price = float(closes[curr_idx])
+    return {
+        "scanner": "ICT",
+        "timeframe": "60",
+        "metric": f"RSI {live_rsi:.1f}",
+        "detail": f"{len(green_pumps)}G | {wick_touches}W",
+        "price": f"{price:.8f}".rstrip("0").rstrip("."),
+    }
+
+
+def check_oc_gap(df_1h: pd.DataFrame):
+    """Open-Close gap setup on recent 1H candles (bullish gap-up / imbalance)."""
+    if df_1h.empty or len(df_1h) < 10:
+        return None
+    opens = df_1h["open"].to_numpy(dtype=float)
+    closes = df_1h["close"].to_numpy(dtype=float)
+    lows = df_1h["low"].to_numpy(dtype=float)
+    highs = df_1h["high"].to_numpy(dtype=float)
+    i = len(df_1h) - 1
+    prev_close = closes[i - 1]
+    curr_open = opens[i]
+    curr_close = closes[i]
+    if prev_close <= 0 or curr_open <= prev_close or curr_close <= curr_open:
+        return None
+    gap_pct = ((curr_open - prev_close) / prev_close) * 100.0
+    if gap_pct < 0.35:
+        return None
+    if i >= 2 and highs[i - 2] < lows[i]:
+        return {
+            "scanner": "OC",
+            "timeframe": "60",
+            "metric": f"Gap +{gap_pct:.2f}%",
+            "detail": f"Low {lows[i]:.6f}".rstrip("0").rstrip("."),
+            "price": f"{curr_close:.8f}".rstrip("0").rstrip("."),
+        }
+    return None
+
+
+def _scan_symbol(symbol: str, base_url: str, shared_session: requests.Session) -> List[Dict[str, Any]]:
+    if _stop_event.is_set():
+        return []
+    found: List[Dict[str, Any]] = []
+    try:
+        df_1h = fetch_klines_df(shared_session, symbol, base_url, "1h", 250)
+        if df_1h.empty or len(df_1h) < 50:
+            return []
+
+        sig_oc = check_oc_gap(df_1h)
+        if sig_oc:
+            found.append(sig_oc)
+
+        rsi_1h_val = float(calculate_rsi(df_1h["close"], 14).iloc[-1])
+        if np.isnan(rsi_1h_val):
+            return found
+
+        if 30.0 <= rsi_1h_val <= 40.0:
+            sig_ict = check_ict(df_1h)
+            if sig_ict:
+                found.append(sig_ict)
+
+        need_30m = (25.0 <= rsi_1h_val <= 40.0) or (52.0 <= rsi_1h_val <= 58.0)
+        df_30m = (
+            fetch_klines_df(shared_session, symbol, base_url, "30m", 150)
+            if need_30m else pd.DataFrame()
+        )
+
+        if 52.0 <= rsi_1h_val <= 58.0 and len(df_1h) >= 210 and not df_30m.empty:
+            if _trend_is_up_ema(df_1h) and _has_fast_movement(df_1h, 0.4) and _sha_green(df_1h):
+                df_1d = fetch_klines_df(shared_session, symbol, base_url, "1d", 250)
+                sig_v1 = check_v1_method(df_1h, df_30m, df_1d)
+                if sig_v1:
+                    found.append(sig_v1)
+
+        if 25.0 <= rsi_1h_val <= 40.0 and not df_30m.empty:
+            sig_hb = check_hideen_bullish(df_1h, df_30m)
+            if sig_hb:
+                found.append(sig_hb)
+
+        trend_pa = _detect_1h_trend_pa(df_1h)
+        if trend_pa in ("UP", "SIDEWAYS"):
+            df_12h = fetch_klines_df(shared_session, symbol, base_url, "12h", 60)
+            sig_pa = check_price_action(df_1h, df_30m, df_12h, shared_session, symbol)
+            if sig_pa:
+                found.append(sig_pa)
+
+        now_dt = datetime.now(timezone.utc)
+        now_str = format_pkt_time(now_dt)
+        now_ts = now_dt.timestamp()
+        for item in found:
+            item["symbol"] = symbol
+            item["detected_at"] = now_str
+            item["created_ts"] = now_ts
+        return found
+    except Exception:
+        return found
+
+
+def _bg_loop() -> None:
+    session = requests.Session()
+    cached_symbols: List[str] = []
+    last_sym_fetch = 0.0
+    working_url = BINANCE_ENDPOINTS[0]
+
+    while not _stop_event.is_set():
+        try:
+            now = time.time()
+            if not cached_symbols or (now - last_sym_fetch) >= SYMBOL_REFRESH_SECONDS:
+                cached_symbols, working_url = get_spot_usdt_symbols(session)
+                last_sym_fetch = time.time()
+
+            with _lock:
+                prune_expired_signals_locked(time.time())
+                SCAN_STATUS["running"] = True
+                SCAN_STATUS["scanned"] = 0
+                SCAN_STATUS["total"] = len(cached_symbols)
+                SCAN_STATUS["working_url"] = working_url
+                SCAN_STATUS["owner"] = OWNER_LABEL
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = [pool.submit(_scan_symbol, sym, working_url, session) for sym in cached_symbols]
+                for fut in as_completed(futures):
+                    if _stop_event.is_set():
+                        break
+                    res_list = fut.result()
+                    now_ts = time.time()
+                    with _lock:
+                        prune_expired_signals_locked(now_ts)
+                        for item in res_list:
+                            cd_key = f"{item['scanner']}:{item['symbol']}"
+                            if (now_ts - ALERT_HISTORY.get(cd_key, 0.0)) >= ALERT_COOLDOWN_SECONDS:
+                                ALERT_HISTORY[cd_key] = now_ts
+                                LATEST_SIGNALS.insert(0, item)
+                                del LATEST_SIGNALS[500:]
+                        SCAN_STATUS["scanned"] += 1
+
+            with _lock:
+                prune_expired_signals_locked(time.time())
+                SCAN_STATUS["last_cycle"] = format_pkt_time(datetime.now(timezone.utc))
+        except Exception:
+            pass
+
+        for _ in range(10):
+            if _stop_event.is_set():
+                break
+            with _lock:
+                prune_expired_signals_locked(time.time())
+            time.sleep(1)
+
+    with _lock:
+        SCAN_STATUS["running"] = False
+    session.close()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    _stop_event.clear()
+    threading.Thread(target=_bg_loop, daemon=True).start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    _stop_event.set()
+
+
+@app.get("/api/signals")
+def get_signals():
+    now_ts = time.time()
+    with _lock:
+        prune_expired_signals_locked(now_ts)
+        return {
+            "status": dict(SCAN_STATUS),
+            "signals": list(LATEST_SIGNALS),
+        }
+
 
 HTML_PAGE = """<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FREEDOM WITH AHMII</title>
   <style>
-    html, body {
+    * { box-sizing: border-box; font-family: 'Segoe UI', Arial, sans-serif; }
+    body {
       margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
       background: #000000;
-      color: #ffffff;
-      font-family: Arial, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
+      color: #f8fafc;
+      min-height: 100vh;
+      padding: 18px 16px 40px;
     }
-    .brand {
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: 2px;
+    .wrap {
+      max-width: 1480px;
+      margin: 0 auto;
+    }
+    .top-brand {
       text-align: center;
+      padding: 14px 16px 18px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .top-brand h1 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 2px;
+      font-weight: 800;
+      color: #ffffff;
+    }
+    .status-line {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #94a3b8;
+      display: flex;
+      justify-content: center;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    .status-line b { color: #38bdf8; }
+    .stack-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .section-row {
+      background: #090d16;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #141c2b;
+    }
+    .section-title {
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+    .t-V1 { color: #34d399; }
+    .t-PA { color: #c084fc; }
+    .t-HB { color: #60a5fa; }
+    .t-ICT { color: #fbbf24; }
+    .t-OC { color: #fb7185; }
+    .section-cnt {
+      font-size: 12px;
+      font-weight: 700;
+      color: #cbd5e1;
+      background: #111827;
+      border: 1px solid #263248;
+      padding: 3px 10px;
+      border-radius: 999px;
+    }
+    .coin-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      min-height: 54px;
+      align-items: center;
+    }
+    .coin-box {
+      background: #101726;
+      border: 1px solid #28354d;
+      border-radius: 9px;
+      padding: 8px 12px;
+      min-width: 132px;
+      cursor: pointer;
+      transition: 0.15s;
+    }
+    .coin-box:hover {
+      border-color: #38bdf8;
+      background: #152036;
+    }
+    .coin-box.flash {
+      border-color: #34d399;
+      box-shadow: 0 0 10px rgba(52, 211, 153, 0.35);
+    }
+    .coin-sym {
+      font-size: 13px;
+      font-weight: 800;
+      color: #ffffff;
+    }
+    .coin-sub {
+      font-size: 11px;
+      color: #34d399;
+      margin-top: 2px;
+      font-weight: 600;
+    }
+    .coin-meta {
+      font-size: 10.5px;
+      color: #94a3b8;
+      margin-top: 2px;
+    }
+    .empty-msg {
+      color: #475569;
+      font-size: 12px;
     }
   </style>
 </head>
 <body>
-  <div class="brand">FREEDOM WITH AHMII</div>
+  <div class="wrap">
+    <div class="top-brand">
+      <h1>FREEDOM WITH AHMII</h1>
+      <div class="status-line">
+        <span>Scanned: <b id="stScan">0/0</b></span>
+        <span>Signals: <b id="stTotal">0</b></span>
+        <span>Cycle: <b id="stCycle">--</b></span>
+      </div>
+    </div>
+
+    <div class="stack-list">
+      <div class="section-row">
+        <div class="section-head">
+          <span class="section-title t-V1">V1 METHOD</span>
+          <span class="section-cnt" id="cnt-V1">0</span>
+        </div>
+        <div class="coin-strip" id="list-V1"></div>
+      </div>
+
+      <div class="section-row">
+        <div class="section-head">
+          <span class="section-title t-PA">PRICE ACTION</span>
+          <span class="section-cnt" id="cnt-PA">0</span>
+        </div>
+        <div class="coin-strip" id="list-PA"></div>
+      </div>
+
+      <div class="section-row">
+        <div class="section-head">
+          <span class="section-title t-HB">HIDDEN BULLISH</span>
+          <span class="section-cnt" id="cnt-HB">0</span>
+        </div>
+        <div class="coin-strip" id="list-HB"></div>
+      </div>
+
+      <div class="section-row">
+        <div class="section-head">
+          <span class="section-title t-ICT">ICT</span>
+          <span class="section-cnt" id="cnt-ICT">0</span>
+        </div>
+        <div class="coin-strip" id="list-ICT"></div>
+      </div>
+
+      <div class="section-row">
+        <div class="section-head">
+          <span class="section-title t-OC">OC GAP</span>
+          <span class="section-cnt" id="cnt-OC">0</span>
+        </div>
+        <div class="coin-strip" id="list-OC"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const CODES = ["V1", "PA", "HB", "ICT", "OC"];
+    let seen = new Set();
+    let fresh = new Set();
+    let first = true;
+
+    function renderSection(code, items) {
+      const boxWrap = document.getElementById(`list-${code}`);
+      const cntEl = document.getElementById(`cnt-${code}`);
+      cntEl.textContent = String(items.length);
+      boxWrap.innerHTML = "";
+
+      if (!items.length) {
+        const em = document.createElement("div");
+        em.className = "empty-msg";
+        em.textContent = "No coins yet";
+        boxWrap.appendChild(em);
+        return;
+      }
+
+      for (const s of items) {
+        const key = `${s.scanner}|${s.symbol}|${s.detected_at}`;
+        const card = document.createElement("div");
+        card.className = "coin-box" + (fresh.has(key) ? " flash" : "");
+        card.onclick = () => {
+          window.open(
+            `https://www.tradingview.com/chart/?symbol=BINANCE:${s.symbol}&interval=${s.timeframe || 60}`,
+            "_blank"
+          );
+        };
+        card.innerHTML = `
+          <div class="coin-sym">${s.symbol}</div>
+          <div class="coin-sub">${s.price || ""}</div>
+          <div class="coin-meta">${s.metric || ""} · ${s.detail || ""}</div>
+        `;
+        boxWrap.appendChild(card);
+      }
+    }
+
+    async function poll() {
+      try {
+        const r = await fetch("/api/signals");
+        const d = await r.json();
+        const st = d.status || {};
+        const all = d.signals || [];
+
+        document.getElementById("stScan").textContent = `${st.scanned || 0}/${st.total || 0}`;
+        document.getElementById("stTotal").textContent = String(all.length);
+        document.getElementById("stCycle").textContent = st.last_cycle || "--";
+
+        const newly = [];
+        for (const s of all) {
+          const k = `${s.scanner}|${s.symbol}|${s.detected_at}`;
+          if (!seen.has(k)) {
+            seen.add(k);
+            if (!first) newly.push(s);
+          }
+        }
+        fresh = new Set(newly.map(x => `${x.scanner}|${x.symbol}|${x.detected_at}`));
+
+        CODES.forEach(c => {
+          renderSection(c, all.filter(x => x.scanner === c));
+        });
+        first = false;
+      } catch (e) {}
+    }
+
+    poll();
+    setInterval(poll, 2000);
+  </script>
 </body>
 </html>
 """
@@ -39,4 +986,4 @@ HTML_PAGE = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
-  return HTML_PAGE
+    return HTML_PAGE
